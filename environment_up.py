@@ -541,7 +541,7 @@ class Environment(gym.Env):
         lambda_ = self.config['weibull_scale']
 
         # 失效成本
-        failure_cost = (self.config['a'] + self.config['p'] * UAV["4_load"][selected_UAV]) * (1 - weibull_reliability(UAV["6_age"][selected_UAV], k, lambda_))
+        failure_cost = (self.config['a'] + self.config['p'] * UAV["4_load"][selected_UAV]) * (weibull_reliability(UAV["6_age"][selected_UAV], k, lambda_))
 
         #总成本
         UAV_total_cost = delivery_cost + failure_cost + maintenance_cost
