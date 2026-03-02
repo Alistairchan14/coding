@@ -13,11 +13,10 @@ import sklearn
 from sklearn.mixture import GaussianMixture
 from torch.distributions import Categorical
 
-
 # 环境导入
 from environment_up import Environment 
 
-env = Environment(num_UAVs = 3, num_customers = 10)  # 假设这里是你的自定义环境
+env = Environment(num_UAVs = 3, num_customers = 10)  # 使用10个客户点
 
 # 设备设置
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -781,7 +780,7 @@ samp_number_dim = 1
 
 maddpg = MADDPG(obs_dim, maintenance_action_dim, routing_action_dim, num_customers, num_UAVs = env.num_UAVs)
 
-ppo = PPO(UAV_input_dim=8 + num_customers, num_UAVs=3, num_customers=10)
+ppo = PPO(UAV_input_dim=8 + num_customers, num_UAVs=num_UAVs, num_customers=num_customers)
 
 
 
@@ -941,8 +940,7 @@ for episode in range(num_episodes):
 
         # 根据obs选择动作
         maintenance_action, routing_action = maddpg.select_action(x_tensor, y_tensor, d_tensor, UAV_obs_tensor_i, selected_UAV)
- 
-        
+
         # 执行一步动作
         next_UAV_obs, rewards, done, cost = env.step(maintenance_action, routing_action , selected_UAV)
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32).to(device)

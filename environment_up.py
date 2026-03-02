@@ -109,7 +109,7 @@ class Environment(gym.Env):
         np.random.seed(seed)
         customer_positions = []  # 用于存储生成的坐标
 
-        while len(customer_positions) < num_customers:
+        while len(customer_positions) < self.num_customers:
             #极坐标
             r = 10 * np.sqrt(np.random.rand())  
             theta = 2 * np.pi * np.random.rand()
@@ -125,7 +125,7 @@ class Environment(gym.Env):
         "生成客户需求"
         
         np.random.seed(seed)
-        customer_cargo_demands = np.round(np.random.uniform(0, 45, size=num_customers), 2) #随机生成客户需求 [10,30)
+        customer_cargo_demands = np.round(np.random.uniform(0, 45, size=self.num_customers), 2) #随机生成客户需求 [10,30)
         return customer_cargo_demands
     
     def update_seed(self):
@@ -298,8 +298,8 @@ class Environment(gym.Env):
 
         # 客户状态重置
         #self.customer_state_space = self.new_customer_state_space()
-        self.customer_state_space = np.zeros((num_UAVs, num_customers))  # 0表示无人机客户暂未匹配
-        self.customer_state_space[:, num_customers // 2:] = -2  # 前半部分是已知客户，后半部分是随机客户标记为-2
+        self.customer_state_space = np.zeros((self.num_UAVs, self.num_customers))  # 0表示无人机客户暂未匹配
+        self.customer_state_space[:, self.num_customers // 2:] = -2  # 前半部分是已知客户，后半部分是随机客户标记为-2
 
         # 决策时刻重置→编进state里面
         # self.decision_time = np.zeros((1, 1), dtype=np.float32) 
