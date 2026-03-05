@@ -6,11 +6,12 @@ import torch.nn.functional as F
 import collections
 import random
 import os
+import time
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
-#pip install scikit-learn
 import sklearn
 from sklearn.mixture import GaussianMixture
+from sklearn.cluster import KMeans
 from torch.distributions import Categorical
 
 # 环境导入
@@ -476,76 +477,42 @@ class MADDPG:
             )
 
 
-# 2. PPOActor 网络
+# 2. PPOActor 网络（按单客户点状态做 UAV 选择）
 # ==========================
 class PPOActor(nn.Module):
-    def __init__(self, UAV_input_dim, num_UAVs, num_customers, hidden_dim=128):
-        """
-        :param state_dim: 状态向量的总维度
-        :param num_UAVs: UAV的数量
-        :param num_customers: 客户点的数量
-        :param hidden_dim: 隐藏层神经元数量
-        """
+    def __init__(self, state_dim, num_UAVs, hidden_dim=128):
         super(PPOActor, self).__init__()
-        self.num_UAVs = num_UAVs
-        self.num_customers = num_customers
-        
-        # 全连接层1
-        self.fc1 = nn.Linear(num_UAVs * UAV_input_dim + 3, hidden_dim)
-        # 全连接层2
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        # 输出层：为 (num_customers * num_UAVs) 个 logits
         self.fc3 = nn.Linear(hidden_dim, num_UAVs)
-        
-    def forward(self, x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor):
+
+    def forward(self, state):
         """
-        前向传播:
-        :param x: [batch_size, state_dim]
-        :return: shape=[batch_size, num_customers, num_UAVs] 的 logits
+        :param state: [batch_size, state_dim]
+        :return: 未归一化 logits, 形状 [batch_size, num_UAVs]
         """
-
-        # 将输入的 x, y, d, UAV_obs_tensor 拼接起来
-        x_i_tensor = x_i_tensor.to(device)
-        y_i_tensor = y_i_tensor.to(device)
-        d_i_tensor = d_i_tensor.to(device)
-        UAV_obs_tensor = UAV_obs_tensor.to(device)
-        UAV_obs_tensor = UAV_obs_tensor.view(-1,1).squeeze(1)
-
-        x = torch.cat([x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor], dim=-1)
-
+        x = state.to(device)
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
-        logits = self.fc3(x)  # shape: [batch_size, num_customers * num_UAVs]
-        
-        # 按照 UAV 维度做 softmax，得到每个顾客点分给 UAV 的概率
-        logits = torch.softmax(logits, dim=-1)  # softmax over UAVs for each customer
-
-        return logits  # [batch_size, num_UAVs, num_customers]
+        logits = self.fc3(x)
+        return logits
 
 # ==========================
 # 3. PPOCritic 网络
 # ==========================
 class PPOCritic(nn.Module):
-    def __init__(self, UAV_input_dim, hidden_dim=128):
+    def __init__(self, state_dim, hidden_dim=128):
         super(PPOCritic, self).__init__()
-        self.fc1 = nn.Linear(UAV_input_dim, hidden_dim)
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        # 输出层：一个标量，用于表示V(s)
         self.fc3 = nn.Linear(hidden_dim, 1)
 
-    def forward(self, x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor):
+    def forward(self, state):
         """
-        前向传播:
-        :param x: [batch_size, state_dim]
-        :return: [batch_size, 1]
+        :param state: [batch_size, state_dim]
+        :return: 价值估计 [batch_size, 1]
         """
-        x_i_tensor = x_i_tensor.to(device)
-        y_i_tensor = y_i_tensor.to(device)
-        d_i_tensor = d_i_tensor.to(device)
-        UAV_obs_tensor = UAV_obs_tensor.to(device)
-        UAV_obs_tensor = UAV_obs_tensor.view(x_i_tensor.shape[0], -1)
-
-        x = torch.cat([x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor], dim=-1)
+        x = state.to(device)
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
         value = self.fc3(x)
@@ -577,6 +544,61 @@ class RolloutBuffer:
 # ==========================
 # 5. PPO 主体
 # ==========================
+def pretrain_ppo_with_clustering(env, ppo, num_iters=200):
+    """
+    使用客户点坐标的 KMeans 聚类结果，对 PPO 的 Actor 进行一次监督预训练：
+    - 聚类簇数 = num_UAVs
+    - 每个客户点的“理想 UAV” = 该点所属簇的编号
+    - 状态使用当前环境 reset 后的 UAV 观测 + 客户点 (x, y, d) 构造，与正式训练保持一致
+    """
+    # 获取客户点信息
+    x, y, d = env.customer_list()  # 形状大致为 [num_customers, 1]
+    x_np = np.array(x).reshape(-1)
+    y_np = np.array(y).reshape(-1)
+    d_np = np.array(d).reshape(-1)
+
+    num_customers = env.num_customers
+    num_UAVs = env.num_UAVs
+
+    # 基于 (x, y) 做聚类
+    coords = np.stack([x_np, y_np], axis=1)  # [num_customers, 2]
+    kmeans = KMeans(n_clusters=num_UAVs, random_state=0)
+    labels = kmeans.fit_predict(coords)  # 每个客户点对应一个 UAV 簇标签 [0, num_UAVs-1]
+
+    # 用当前环境观测构造状态
+    UAV_obs = env.reset()
+    UAV_obs_array = np.array(UAV_obs)
+    UAV_obs_tensor = torch.tensor(UAV_obs_array, dtype=torch.float32).to(device)
+
+    states = []
+    target_actions = []
+    for i in range(num_customers):
+        x_i_tensor = torch.tensor(x_np[i], dtype=torch.float32, device=device).unsqueeze(0)
+        y_i_tensor = torch.tensor(y_np[i], dtype=torch.float32, device=device).unsqueeze(0)
+        d_i_tensor = torch.tensor(d_np[i], dtype=torch.float32, device=device).unsqueeze(0)
+
+        state = ppo._build_state(x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor).squeeze(0)
+        states.append(state)
+        target_actions.append(labels[i])
+
+    states_tensor = torch.stack(states, dim=0)  # [num_customers, state_dim]
+    actions_tensor = torch.tensor(target_actions, dtype=torch.long, device=device)  # [num_customers]
+
+    print(f"开始基于聚类的 PPO 预训练，样本数: {num_customers}, 迭代轮数: {num_iters}")
+    for it in range(num_iters):
+        logits = ppo.actor(states_tensor)  # [num_customers, num_UAVs]
+        loss = F.cross_entropy(logits, actions_tensor)
+
+        ppo.optimizer_actor.zero_grad()
+        loss.backward()
+        ppo.optimizer_actor.step()
+
+        if (it + 1) % max(1, num_iters // 4) == 0:
+            print(f"PPO 预训练迭代 {it + 1}/{num_iters}, 监督损失: {loss.item():.4f}")
+
+    print("PPO 基于聚类的预训练完成。")
+
+
 class PPO:
     def __init__(self,
                  UAV_input_dim,
@@ -606,8 +628,8 @@ class PPO:
         self.eps_clip = eps_clip
         self.k_epochs = k_epochs
 
-        # 建立 Actor 和 Critic
-        self.actor = PPOActor(UAV_input_dim, num_UAVs, num_customers, hidden_dim).to(device)
+        # 建立 Actor 和 Critic（输入为单步状态向量）
+        self.actor = PPOActor(UAV_input_dim, num_UAVs, hidden_dim).to(device)
         self.critic = PPOCritic(UAV_input_dim, hidden_dim).to(device)
 
         # 优化器
@@ -617,75 +639,113 @@ class PPO:
         # 经验回放缓冲
         self.buffer = RolloutBuffer()
 
-    def select_action(self, x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor):
+    def _build_state(self, x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor):
         """
-        根据当前策略选取动作 (分配矩阵)
-        
-        :param state: numpy 数组 shape [state_dim, ]，单步
-        :param customer_status: shape [num_customers, ]，表示每个客户点对本次分配的需求情况
-               -1 表示“待分配”，否则表示“不用分配”，可以是0或1等标识
-        :param use_argmax: True表示每个客户点选取概率最大的 UAV，False表示随机采样(适合训练)
-        :return: 
-          action_matrix: [num_customers, num_UAVs] 的0-1分配矩阵
-          log_prob_sum: 该动作的log_prob之和(标量)
-          value: Critic对当前状态的价值估计(标量，用于后续计算优势函数)
+        将单个客户点信息和当前 UAV 观测拼成一个固定维度的状态向量:
+        [x_i, y_i, d_i, sum_task_over_uavs, padding...]
         """
-        # 转为tensor，放到GPU
         x_i_tensor = x_i_tensor.to(device)
         y_i_tensor = y_i_tensor.to(device)
         d_i_tensor = d_i_tensor.to(device)
-        
         UAV_obs_tensor = UAV_obs_tensor.to(device)
-        
-        # 得到logits => shape=[1, num_customers, num_UAVs]
-        logits = self.actor(x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor)  # [1, C, U]
 
+        # 任务矩阵在 UAV_obs 的最后 num_customers 列
+        task = UAV_obs_tensor[:, -self.num_customers:]  # [num_UAVs, num_customers]
+        task_sum = task.sum(dim=0, keepdim=True)        # [1, num_customers]
 
-        m = torch.distributions.Categorical(logits)
-        CA_actions = m.sample()  # [B, C]，每个客户点选中的 UAV 编号
-        index=CA_actions.unsqueeze(0).unsqueeze(0)
+        base = torch.stack(
+            [x_i_tensor.squeeze(), y_i_tensor.squeeze(), d_i_tensor.squeeze()],
+            dim=-1
+        ).unsqueeze(0)  # [1, 3]
 
-        #计算log_prob_sum
-        log_prob = m.log_prob(CA_actions)  # [B]
-        log_prob_sum = log_prob.sum()  # [B]
+        state = torch.cat([base, task_sum], dim=-1)     # [1, 3 + num_customers]
 
-        batch_size = x_i_tensor.shape[0]  # 获取批次大小
-        assignment_matrix = torch.zeros(batch_size, num_UAVs, device=logits.device)  # 初始化分配矩阵 [B, U]
-        assignment_matrix.scatter_(dim=1, index=index, value=1)  # 将选中的 UAV 编号位置置为 1
+        # 根据 UAV_input_dim 做截断/填充，确保维度一致
+        state_dim = state.shape[1]
+        if state_dim < self.UAV_input_dim:
+            pad = torch.zeros(1, self.UAV_input_dim - state_dim, device=device)
+            state = torch.cat([state, pad], dim=1)
+        elif state_dim > self.UAV_input_dim:
+            state = state[:, :self.UAV_input_dim]
 
-        return assignment_matrix, CA_actions, log_prob_sum
+        return state  # [1, UAV_input_dim]
 
-
-    def remember(self, UAV_obs, action_matrix, log_prob, reward, done, value):
+    def select_action(self, x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor):
         """
-        存储交互数据到buffer
-        :param state: 当前时刻状态(一维numpy)
-        :param action_matrix: [num_uavs, num_customers]的0-1分配矩阵
-        :param log_prob: 对应动作的对数概率(标量)
-        :param reward: 环境反馈的即时奖励
-        :param done: 是否回合结束
-        :param value: Critic对当前状态的价值估计(标量)
+        根据当前策略选取动作 (为该客户点选择一个 UAV)
+        :return:
+          assignment_one_hot: [num_UAVs] 的 0-1 向量
+          action: 标量 UAV 索引
+          log_prob: 对数概率（标量 Tensor）
+          value: Critic 对当前状态的价值估计（标量 Tensor）
+          state: 当前状态向量（[state_dim]）
         """
-        self.buffer.UAV_obs.append(UAV_obs)
-        # 动作扁平化后存储
-        # 形状 [num_uavs * num_customers]
-        action_flat = action_matrix.flatten()  
-        self.buffer.actions.append(action_flat)
-        self.buffer.log_probs.append(log_prob.item())  # 转为标量存储
-        self.buffer.rewards.append(reward)
-        self.buffer.is_terminals.append(done)
-        self.buffer.values.append(value)
+        # 构造单步状态
+        state = self._build_state(x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor)  # [1, state_dim]
+
+        logits = self.actor(state)                               # [1, num_UAVs]
+        probs = torch.softmax(logits, dim=-1)                    # [1, num_UAVs]
+        m = Categorical(probs)
+        action = m.sample()                                      # [1]
+        log_prob = m.log_prob(action)                            # [1]
+        value = self.critic(state).squeeze(-1)                   # [1]
+
+        assignment_one_hot = torch.zeros_like(probs)             # [1, num_UAVs]
+        assignment_one_hot.scatter_(1, action.unsqueeze(-1), 1.0)
+
+        return (
+            assignment_one_hot.squeeze(0),   # [num_UAVs]
+            action.squeeze(0),               # 标量
+            log_prob.squeeze(0),             # 标量
+            value.squeeze(0),                # 标量
+            state.squeeze(0)                 # [state_dim]
+        )
+
+
+    def remember(self, state, action, log_prob, reward, done, value):
+        """
+        存储单步交互数据到 buffer
+        """
+        # 状态向量
+        if isinstance(state, torch.Tensor):
+            state_np = state.detach().cpu().numpy()
+        else:
+            state_np = np.array(state, dtype=np.float32)
+        self.buffer.UAV_obs.append(state_np)
+
+        # 动作（UAV 索引，标量）
+        if isinstance(action, torch.Tensor):
+            action_val = int(action.item())
+        else:
+            action_val = int(action)
+        self.buffer.actions.append(action_val)
+
+        # 对数概率
+        if isinstance(log_prob, torch.Tensor):
+            log_prob_val = float(log_prob.item())
+        else:
+            log_prob_val = float(log_prob)
+        self.buffer.log_probs.append(log_prob_val)
+
+        # 奖励 / 终止标记 / 价值估计
+        self.buffer.rewards.append(float(reward))
+        self.buffer.is_terminals.append(bool(done))
+        if isinstance(value, torch.Tensor):
+            value_val = float(value.item())
+        else:
+            value_val = float(value)
+        self.buffer.values.append(value_val)
 
     def update(self):
         """
         使用回放缓冲中的数据进行 PPO 更新
         """
         # 1. 把经验回放的数据转换为 Tensor
-        old_states = torch.FloatTensor(self.buffer.UAV_obs).to(device)
-        old_actions = torch.FloatTensor(self.buffer.actions).to(device)
-        old_log_probs = torch.FloatTensor(self.buffer.log_probs).to(device)
-        rewards = torch.FloatTensor(self.buffer.rewards).to(device)
-        old_values = torch.FloatTensor(self.buffer.values).to(device)
+        old_states = torch.FloatTensor(self.buffer.UAV_obs).to(device)   # [T, state_dim]
+        old_actions = torch.LongTensor(self.buffer.actions).to(device)   # [T]
+        old_log_probs = torch.FloatTensor(self.buffer.log_probs).to(device)  # [T]
+        rewards = torch.FloatTensor(self.buffer.rewards).to(device)          # [T]
+        old_values = torch.FloatTensor(self.buffer.values).to(device)        # [T]
         is_terminals = self.buffer.is_terminals
 
         # 2. 计算回合/序列的Returns和Advantage
@@ -704,31 +764,12 @@ class PPO:
         batch_size = len(old_states)
         for _ in range(self.k_epochs):
             # (a) 计算新策略下的 log_prob、价值
-            logits = self.actor(old_states)  # [batch_size, num_customers, num_UAVs]
-            prob_matrix = torch.softmax(logits, dim=-1)  # [batch_size, num_customers, num_UAVs]
+            logits = self.actor(old_states)                          # [batch_size, num_UAVs]
+            probs = torch.softmax(logits, dim=-1)
+            dist = Categorical(probs)
+            new_log_probs = dist.log_prob(old_actions)               # [batch_size]
 
-            # 因为我们在 buffer 里存的是 action 的 0-1 展开向量
-            # 需要还原为 [batch_size, num_customers, num_UAVs]
-            reshaped_actions = old_actions.view(batch_size, self.num_UAVs, self.num_customers)
-
-            log_probs_new = []
-            for i in range(batch_size):
-                single_prob_list = []
-                for c in range(self.num_customers):
-                    # 找到分配的uav索引
-                    uav_idx = (reshaped_actions[i, :, c] == 1).nonzero(as_tuple=True)
-                    if len(uav_idx[0]) == 0:
-                        # 如果没选任何UAV(极端情况)
-                        p = 1e-8
-                    else:
-                        idx = uav_idx[0].item()
-                        p = prob_matrix[i, idx, c]
-                    single_prob_list.append(p)
-                single_prob_tensor = torch.stack(single_prob_list)
-                log_probs_new.append(torch.log(single_prob_tensor + 1e-8).sum())
-            new_log_probs = torch.stack(log_probs_new)  # [batch_size]
-
-            values = self.critic(old_states).squeeze(1)  # [batch_size]
+            values = self.critic(old_states).squeeze(1)              # [batch_size]
 
             # (b) ratio
             ratio = torch.exp(new_log_probs - old_log_probs)
@@ -782,6 +823,8 @@ maddpg = MADDPG(obs_dim, maintenance_action_dim, routing_action_dim, num_custome
 
 ppo = PPO(UAV_input_dim=8 + num_customers, num_UAVs=num_UAVs, num_customers=num_customers)
 
+# 基于客户点聚类对 PPO 做一次预训练
+pretrain_ppo_with_clustering(env, ppo, num_iters=200)
 
 
 samp_number = 1  # 初始采样编号
@@ -824,10 +867,19 @@ record_count = 0  # 用于记录已保存的次数
 update_interval = 50
 step_counter = 0
 
+# 交替训练配置：每 (ppo_train_interval + 1) 个 episode 中，有 1 个用于训练 PPO，其余训练 MADDPG
+ppo_train_interval = 4  # 例如：4 个 episode 训练 MADDPG，1 个 episode 训练 PPO
+
+# 训练轮数
+num_episodes = 1000
+
+# 记录训练开始时间
+train_start_time = time.time()
+
 # 开始训练
-# train_maddpg(env, maddpg)
-num_episodes = 50
 for episode in range(num_episodes):
+    train_ppo_this_episode = ((episode + 1) % (ppo_train_interval + 1) == 0)
+    train_maddpg_this_episode = not train_ppo_this_episode
     UAV_rewards = [0 for _ in range(num_UAVs)]  # 每个episode开始时，重置每台无人机的reward
     UAV_routes = [[] for _ in range(num_UAVs)]  # 存储每台无人机的路径
     UAV_costs = [0 for _ in range(num_UAVs)]  # 每台无人机的成本初始化
@@ -842,7 +894,14 @@ for episode in range(num_episodes):
     x, y, d = env.customer_list()
 
     while not done:
-        
+        # 随机故障事件：在已有多步分配后，以配置概率令某架有任务的 UAV 故障，触发动态重规划
+        min_steps = env.config.get('fault_min_steps_before_trigger', 2)
+        fault_prob = env.config.get('fault_prob_per_step', 0.02)
+        if step_counter >= min_steps:
+            new_obs = env.trigger_random_fault(probability=fault_prob)
+            if new_obs is not None:
+                UAV_obs = new_obs
+
         #把xyd转换为tensor
         x_tensor = torch.tensor(x, dtype=torch.float32).squeeze().to(device)
         y_tensor = torch.tensor(y, dtype=torch.float32).squeeze().to(device)
@@ -860,18 +919,31 @@ for episode in range(num_episodes):
         # 对每一个客户点检查是否还没有被分配（某一列全为 0）
         for i in range(num_customers):
             if torch.all(task[:, i] == 0):  # 第 i 个客户点还没有被分配
-        # 获取客户点 i 的信息
+                # 获取客户点 i 的信息
                 x_i = x_tensor[0]
                 y_i = y_tensor[0]
-                d_i = d_tensor[0]   
-        
-                #把xyd转换为tensor
+                d_i = d_tensor[0]
+
+                # 把 x, y, d 转换为 tensor
                 x_i_tensor = torch.tensor(x_i, dtype=torch.float32).to(device).unsqueeze(0)
                 y_i_tensor = torch.tensor(y_i, dtype=torch.float32).to(device).unsqueeze(0)
                 d_i_tensor = torch.tensor(d_i, dtype=torch.float32).to(device).unsqueeze(0)
-        
-                # 执行 PPO 动作选择
-                assignment_action, _, _= ppo.select_action(x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor)
+
+                # 执行 PPO 动作选择（为该客户点选择一个 UAV）
+                assignment_action, uav_action, log_prob, value, ppo_state = ppo.select_action(
+                    x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor
+                )
+
+                # 若本 episode 用于训练 PPO，则记录经验（即时奖励先记 0，终止标记先记 False）
+                if train_ppo_this_episode:
+                    ppo.remember(
+                        ppo_state,
+                        uav_action,
+                        log_prob,
+                        reward=0.0,
+                        done=False,
+                        value=value,
+                    )
 
                 selected_customer = i  # 记录被选中的客户点编号
                 selected_customer_tensor = torch.tensor(selected_customer, dtype=torch.float32).unsqueeze(0).to(device)
@@ -886,20 +958,32 @@ for episode in range(num_episodes):
                 UAV_obs = next_UAV_obs
         
 
-        # 检查倒数6列中是否有 -1 值，如果有 -1 值，才进行后续处理
+        # 检查任务列中是否有 -1 值，如果有 -1 值，表示需要重新分配
         for i in range(num_customers):
-            if torch.any(task[:, i] == -1):  # 如果这一列中有 -1 值，表示需要重新分配
+            if torch.any(task[:, i] == -1):
                 x_i = x_tensor[0]
                 y_i = y_tensor[0]
                 d_i = d_tensor[0]
-        
-                #把xyd转换为tensor
+
+                # 把 x, y, d 转换为 tensor
                 x_i_tensor = torch.tensor(x_i, dtype=torch.float32).to(device).unsqueeze(0)
                 y_i_tensor = torch.tensor(y_i, dtype=torch.float32).to(device).unsqueeze(0)
                 d_i_tensor = torch.tensor(d_i, dtype=torch.float32).to(device).unsqueeze(0)
-        
-                # 执行 PPO 动作选择
-                assignment_action, _, _= ppo.select_action(x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor)
+
+                # 执行 PPO 动作选择（为该客户点重新选择 UAV）
+                assignment_action, uav_action, log_prob, value, ppo_state = ppo.select_action(
+                    x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor
+                )
+
+                if train_ppo_this_episode:
+                    ppo.remember(
+                        ppo_state,
+                        uav_action,
+                        log_prob,
+                        reward=0.0,
+                        done=False,
+                        value=value,
+                    )
 
                 selected_customer = i  # 记录被选中的客户点编号
                 selected_customer_tensor = torch.tensor(selected_customer, dtype=torch.float32).unsqueeze(0).to(device)
@@ -956,8 +1040,12 @@ for episode in range(num_episodes):
                           rewards_tensor, next_UAV_obs_tensor, done_tensor, selected_UAV_tensor)
             
 
-        # 每隔固定步数（50步）更新MADDPG
-        if step_counter % update_interval == 0 and replay_buffer.size() >= maddpg.batch_size:  # 确保buffer中有足够的数据
+        # 每隔固定步数（50步）更新MADDPG（仅在当前 episode 训练 MADDPG 时）
+        if (
+            train_maddpg_this_episode
+            and step_counter % update_interval == 0
+            and replay_buffer.size() >= maddpg.batch_size  # 确保buffer中有足够的数据
+        ):
             batch = replay_buffer.sample(maddpg.batch_size)
             samp_number_tensor_batch, x_tensor_batch, y_tensor_batch, d_tensor_batch, UAV_obs_batch, maintenance_action_batch, routing_action_batch, \
                 rewards_batch, next_UAV_obs_batch, done_batch, selected_UAV_batch = batch
@@ -1023,6 +1111,15 @@ for episode in range(num_episodes):
     episode_cost = total_cost
     episode_reward_b = -total_cost
 
+    # 如果本 episode 用于训练 PPO，则在 episode 结束后，用总成本构造 PPO 的回报并更新
+    if train_ppo_this_episode and len(ppo.buffer.rewards) > 0:
+        num_steps = len(ppo.buffer.rewards)
+        # 把总成本均匀分配到本 episode 的每个 PPO 决策步，作为简单近似
+        step_reward = -float(episode_cost) / num_steps
+        ppo.buffer.rewards = [step_reward for _ in range(num_steps)]
+        ppo.buffer.is_terminals[-1] = True
+        ppo.update()
+
     for i, reward in enumerate(UAV_rewards):
         #writer.add_scalar(f'UAV_Rewards/UAV{i+1}', reward, episode)
         writer.add_scalars(
@@ -1044,13 +1141,19 @@ for episode in range(num_episodes):
     episode_rewards.append(total_reward)
     print(f'Episode {episode} completed. Total reward: {total_reward}')
 
-    # 输出每台无人机的路径和成本到日志文件
+    # 记录当前 episode 的客户点分配矩阵（env.customer_state_space）
+    assignment_matrix = env.customer_state_space  # 形状约为 [num_UAVs, num_customers]
+    print(f'Episode {episode} customer assignment matrix:\n{assignment_matrix}')
+
+    # 输出每台无人机的路径、成本以及客户分配矩阵到日志文件
     with open(log_file_path, 'a') as f:
         f.write(f"Episode {episode}:\n")
         f.write(f"Customer_x:{x}:\n")
         f.write(f"Customer_y:{y}:\n")
         f.write(f"Customer_d:{d}:\n")
         f.write(f"UAV_obs:{UAV_obs}:\n")
+        f.write("Customer assignment matrix (rows = UAVs, cols = customers):\n")
+        f.write(np.array2string(assignment_matrix, separator=',') + "\n")
         for i in range(num_UAVs):
             f.write(f"UAV{i + 1} routes: {'-'.join(map(str, UAV_routes[i]))}, cost: {UAV_rewards[i]}\n")
         f.write(f"Total reward: {total_reward}\n")
@@ -1101,6 +1204,14 @@ for episode in range(num_episodes):
         done = True  # 结束训练
     """
 
+# 训练结束，记录总训练时长
+train_end_time = time.time()
+total_train_seconds = train_end_time - train_start_time
+print(f'总训练时长: {total_train_seconds:.2f} 秒')
+
+with open(log_file_path, 'a') as f:
+    f.write(f"\nTotal training time: {total_train_seconds:.2f} seconds\n")
+
 # 训练结束后关闭TensorBoard writer
 writer.close()
 
@@ -1120,7 +1231,7 @@ plt.legend()  # 确保调用 legend() 以显示图例
 plt.show()
 
 # 假设 self.actor 是你的 Actor 网络实例
-save_dir = 'D:\\JNU\\AApaper\\code\\new\\up\\record'  # 保存目录
+save_dir = 'D:\\coding\\result'  # 保存目录
 if not os.path.exists(save_dir):
     os.makedirs(save_dir)  # 如果目录不存在，则创建
 

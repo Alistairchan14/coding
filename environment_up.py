@@ -1,6 +1,3 @@
-#pip install scipy
-#pip install gym
-#pip install seaborn
 from typing import Tuple
 import numpy as np
 import matplotlib.pyplot as plt
@@ -16,7 +13,7 @@ import math
 
 #参数设置   （全都丢进config）
 num_UAVs = 3
-num_customers = 20
+num_customers = 10
 fix_v = 60
 c_electricity = 0.6  # 配送成本参数（电价）
 c_fix = 100  # 维修成本参数
@@ -240,7 +237,10 @@ class Environment(gym.Env):
             'energy_parameter': 18,  # 电量计算参数
             'weibull_shape': 1.5,  # 威布尔分布的形状参数
             'weibull_scale': 100,  # 威布尔分布的尺度参数
-            'weibull_function': lambda size=None: weibull_min(config['weibull_shape'], config['weibull_scale'], size)
+            'weibull_function': lambda size=None: weibull_min(config['weibull_shape'], config['weibull_scale'], size),
+            # 随机故障事件（动态重规划）
+            'fault_prob_per_step': 0.02,       # 每步触发随机故障的概率
+            'fault_min_steps_before_trigger': 2 # 至少经过多少步后才可能触发故障
         }
         return config
     
@@ -369,6 +369,53 @@ class Environment(gym.Env):
             print(f"UAV_obs_matrix: {type(UAV_obs_matrix)}")
             
         return UAV_obs
+
+    def _refresh_UAV_obs(self):
+        """根据当前 UAV_state 和 customer_state_space 重新生成观测并更新 UAV_obs_matrix，返回观测列表。"""
+        UAV_obs = []
+        for i in range(self.num_UAVs):
+            position = self.UAV_state["1_position"][i, 0]
+            destination = self.UAV_state["2_destination"][i, 0]
+            arrival_time = self.UAV_state["3_arrival_time"][i, 0]
+            load = self.UAV_state["4_load"][i, 0]
+            energy = self.UAV_state["5_energy"][i, 0]
+            age = self.UAV_state["6_age"][i, 0]
+            broken = self.UAV_state["7_broken"][i, 0]
+            decision_time = self.UAV_state["8_decision_time"][i, 0]
+            customer_state = self.customer_state_space[i, :]
+            o_1 = np.array([position, destination, arrival_time, load, energy, age, broken, decision_time])
+            o_2 = np.array([*customer_state])
+            o = np.concatenate([o_1, o_2])
+            UAV_obs.append(o)
+        self.UAV_obs_matrix = np.vstack(UAV_obs)
+        return UAV_obs
+
+    def trigger_random_fault(self, probability=0.0):
+        """
+        以一定概率触发随机故障：随机选一架当前有任务(存在1)且未故障的无人机，设为故障并不可用，
+        将其任务列由 1 改为 -1，触发上层动态重分配。故障机需回仓库维修后才会恢复。
+        :param probability: 本步触发故障的概率
+        :return: 若触发了故障则返回更新后的 UAV_obs 列表，否则返回 None（主循环可据此更新局部 UAV_obs）
+        """
+        if probability <= 0 or random.random() >= probability:
+            return None
+        # 找当前未故障且至少有一个任务(1)的无人机
+        candidates = []
+        for i in range(self.num_UAVs):
+            if self.UAV_state["7_broken"][i, 0] == 1:
+                continue
+            if np.any(self.customer_state_space[i, :] == 1):
+                candidates.append(i)
+        if not candidates:
+            return None
+        chosen = random.choice(candidates)
+        self.UAV_state["7_broken"][chosen, 0] = 1
+        # 该机所有为 1 的客户改为 -1，表示需重新分配
+        self.customer_state_space[chosen, :] = np.where(
+            self.customer_state_space[chosen, :] == 1, -1, self.customer_state_space[chosen, :]
+        )
+        print(f"[故障事件] UAV {chosen + 1} 发生故障，其任务已标记为需重分配(-1)，将优先回仓库维修。")
+        return self._refresh_UAV_obs()
 
     def selected_UAV(self):
         valid_indices = []
