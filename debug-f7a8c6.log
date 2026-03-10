@@ -1,0 +1,2 @@
+{"sessionId": "f7a8c6", "runId": "ga_flow", "hypothesisId": "H1", "location": "maddpg.py:before_ga_run", "message": "before task_ga.run()", "data": {"episode": 0}, "timestamp": 1772866921131}
+{"sessionId": "f7a8c6", "runId": "ga_flow", "hypothesisId": "H1", "location": "TaskAssignmentGA.run:entry", "message": "GA.run() entered", "data": {"num_customers": 10, "num_UAVs": 3, "max_gen": 100}, "timestamp": 1772866921131}

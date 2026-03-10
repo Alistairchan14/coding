@@ -1,3 +1,7 @@
+import os
+# 在 import torch 之前设置 CUDA 设备，确保使用 GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -5,7 +9,6 @@ import torch.optim as optim
 import torch.nn.functional as F
 import collections
 import random
-import os
 import time
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
@@ -19,10 +22,11 @@ from environment_up import Environment
 
 env = Environment(num_UAVs = 3, num_customers = 10)  # 使用10个客户点
 
-# 设备设置
+# 设备设置：优先使用 CUDA
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-CUDA_VISIBLE_DEVICES = 0
+print(f"Using device: {device}")
+if device.type == "cuda":
+    print(f"  GPU: {torch.cuda.get_device_name(0)}")
 
 
 # 定义Actor网络，输出维修action和路径action
@@ -99,6 +103,7 @@ class ActorNetwork(nn.Module):
         fix_v = torch.tensor(env.fix_v).to(device)  # 获取固定飞行速度
         energy_parameter = torch.tensor(env.config['energy_parameter']).to(device)  # 获取能量参数
         max_energy = torch.tensor(env.max_energy).to(device)  # 获取最大能量
+        min_energy = torch.tensor(env.min_energy).to(device)  # 获取最小能量阈值（config 可配置）
 
         # 屏蔽损坏的无人机：
         # 若某无人机损坏（broken=1），则只允许返回仓库（第1列为True，其余列为False）
@@ -126,8 +131,8 @@ class ActorNetwork(nn.Module):
             # 计算从客户点 j 返回仓库后的剩余电量
             energy_to_warehouse = energy_to_j - energy_parameter * load_to_j * arrival_time_to_warehouse * 0.1 / max_energy
 
-            # 如果载重超限或电量不足，屏蔽对应客户点的动作
-            masks[:, j] &= (load + demand_j <= max_UAVs_load) & (energy_to_warehouse > 0)
+            # 如果载重超限或电量不足（低于 min_energy），屏蔽对应客户点的动作
+            masks[:, j] &= (load + demand_j <= max_UAVs_load) & (energy_to_warehouse > min_energy)
 
         # 将 masks 调整为适配单样本和多样本的格式
         if is_batch:
@@ -604,10 +609,10 @@ class PPO:
                  UAV_input_dim,
                  num_UAVs,
                  num_customers,
-                 lr_actor=1e-4,
-                 lr_critic=1e-4,
+                 lr_actor=5e-5,
+                 lr_critic=5e-5,
                  gamma=0.99,
-                 k_epochs=10,
+                 k_epochs=4,
                  eps_clip=0.2,
                  hidden_dim=128):
         """
@@ -750,15 +755,20 @@ class PPO:
 
         # 2. 计算回合/序列的Returns和Advantage
         returns = []
-        discounted_sum = 0
+        discounted_sum = 0.0
         for reward, done in zip(reversed(rewards), reversed(is_terminals)):
             if done:
-                discounted_sum = 0
+                discounted_sum = 0.0
             discounted_sum = reward + self.gamma * discounted_sum
             returns.insert(0, discounted_sum)
         returns = torch.FloatTensor(returns).to(device)
 
         advantages = returns - old_values  # 简单 Advantage
+        # 仅对 advantage 做标准化，提升稳定性
+        adv_mean = advantages.mean()
+        adv_std = advantages.std()
+        if adv_std > 1e-8:
+            advantages = (advantages - adv_mean) / (adv_std + 1e-8)
 
         # 3. PPO多轮更新
         batch_size = len(old_states)
@@ -838,16 +848,16 @@ UAV_rewards = [0 for _ in range(num_UAVs)]  # 存储每台无人机的reward
 total_reward = 0
 episode_rewards = [] # 存储每个episode的reward
 
-# 创建SummaryWriter对象来记录数据
-log_dir = 'D:\\JNU\\AApaper\\code\\new\\up\\record'
+# 创建SummaryWriter对象来记录数据（统一保存到当前项目下的 result 文件夹）
+log_dir = 'D:\\coding\\result'
 writer = SummaryWriter(log_dir=log_dir)
-#输入这个：tensorboard --logdir=D:\JNU\AApaper\code\somepic
+# 运行 tensorboard 时使用：tensorboard --logdir=D:\coding\result
 
-# 指定日志文件路径
-log_file_path = 'D:\\JNU\\AApaper\\code\\new\\up\\record\\1.txt'
+# 指定日志文件路径（同样放在 result 目录下）
+log_file_path = 'D:\\coding\\result\\1.txt'
 # 新的网络参数日志路径（每50代保存一次）
-network_log_file_path = 'D:\\JNU\\AApaper\\code\\new\\up\\record\\2.txt'
-seed_log_file_path = 'D:\\JNU\\AApaper\\code\\new\\up\\record\\3.txt'
+network_log_file_path = 'D:\\coding\\result\\2.txt'
+seed_log_file_path = 'D:\\coding\\result\\3.txt'
 
 # 如果文件已存在，清空文件内容
 if os.path.exists(log_file_path):
@@ -867,19 +877,39 @@ record_count = 0  # 用于记录已保存的次数
 update_interval = 50
 step_counter = 0
 
-# 交替训练配置：每 (ppo_train_interval + 1) 个 episode 中，有 1 个用于训练 PPO，其余训练 MADDPG
-ppo_train_interval = 4  # 例如：4 个 episode 训练 MADDPG，1 个 episode 训练 PPO
+# 冻结交替训练配置：
+# 采用“成段冻结”的方式：连续若干个 episode 只训练 MADDPG，接着若干个 episode 只训练 PPO，循环往复。
+freeze_block_maddpg = 5  # 每个 MADDPG-only 段的长度（episode 数）
+freeze_block_ppo = 5     # 每个 PPO-only 段的长度（episode 数）
 
-# 训练轮数
-num_episodes = 1000
+# PPO 终止奖励中融合 episode 总成本的权重（越大表示 PPO 越关注路径成本）
+ppo_terminal_cost_weight = 1e-4
+
+# 训练轮数与结束条件
+max_episodes = 10000   # 最大 episode 数，达到后结束训练
+convergence_early_stop = True   # True：一旦判定收敛则提前结束训练；False：收敛后仅换种子继续直到 max_episodes
+convergence_window = 10        # 用于判定收敛的最近 episode 数量
+convergence_threshold = 0.001  # 最近 convergence_window 个 cost 的 (max-min) 小于此值则判定收敛
+num_episodes = max_episodes
 
 # 记录训练开始时间
 train_start_time = time.time()
 
 # 开始训练
 for episode in range(num_episodes):
-    train_ppo_this_episode = ((episode + 1) % (ppo_train_interval + 1) == 0)
-    train_maddpg_this_episode = not train_ppo_this_episode
+    # 冻结交替：根据当前 episode 所在的块决定本轮只训谁
+    cycle_len = freeze_block_maddpg + freeze_block_ppo
+    pos_in_cycle = episode % cycle_len
+    if pos_in_cycle < freeze_block_maddpg:
+        train_maddpg_this_episode = True
+        train_ppo_this_episode = False
+    else:
+        train_maddpg_this_episode = False
+        train_ppo_this_episode = True
+    # 同步环境中的 episode 计数与步数
+    env.current_episode = episode
+    env.current_step = 0
+
     UAV_rewards = [0 for _ in range(num_UAVs)]  # 每个episode开始时，重置每台无人机的reward
     UAV_routes = [[] for _ in range(num_UAVs)]  # 存储每台无人机的路径
     UAV_costs = [0 for _ in range(num_UAVs)]  # 每台无人机的成本初始化
@@ -889,18 +919,10 @@ for episode in range(num_episodes):
     episode_actor_loss = 0  # 每个episode的总actor损失
     UAV_obs = env.reset()
     done = False
-    
-    # 提取x,y,d分别是客户点的x坐标、y坐标和需求量
-    x, y, d = env.customer_list()
 
     while not done:
-        # 随机故障事件：在已有多步分配后，以配置概率令某架有任务的 UAV 故障，触发动态重规划
-        min_steps = env.config.get('fault_min_steps_before_trigger', 2)
-        fault_prob = env.config.get('fault_prob_per_step', 0.02)
-        if step_counter >= min_steps:
-            new_obs = env.trigger_random_fault(probability=fault_prob)
-            if new_obs is not None:
-                UAV_obs = new_obs
+        # 每一步都重新获取当前客户点信息，以便支持动态出现的新客户
+        x, y, d = env.customer_list()
 
         #把xyd转换为tensor
         x_tensor = torch.tensor(x, dtype=torch.float32).squeeze().to(device)
@@ -934,23 +956,20 @@ for episode in range(num_episodes):
                     x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor
                 )
 
-                # 若本 episode 用于训练 PPO，则记录经验（即时奖励先记 0，终止标记先记 False）
+                selected_customer = i  # 记录被选中的客户点编号
+                selected_customer_tensor = torch.tensor(selected_customer, dtype=torch.float32).unsqueeze(0).to(device)
+                # 执行一步动作
+                next_UAV_obs, reward_CA, done_CA, cost_CA = env.step_CA(assignment_action, selected_customer_tensor)
+                # 若本 episode 用于训练 PPO，则记录基于 CA 的时序奖励
                 if train_ppo_this_episode:
                     ppo.remember(
                         ppo_state,
                         uav_action,
                         log_prob,
-                        reward=0.0,
-                        done=False,
+                        reward=float(reward_CA),
+                        done=bool(done_CA),
                         value=value,
                     )
-
-                selected_customer = i  # 记录被选中的客户点编号
-                selected_customer_tensor = torch.tensor(selected_customer, dtype=torch.float32).unsqueeze(0).to(device)
-                # 执行一步动作
-                next_UAV_obs, reward_CA, done_CA, cost_CA = env.step_CA(assignment_action, selected_customer_tensor)
-                #reward_CA_tensor = torch.tensor(reward_CA, dtype=torch.float32).to(device)
-                #done_CA_tensor = torch.tensor(done_CA, dtype=torch.float32).to(device)
 
                 # 把next_UAV_obs转换为tensor
                 next_UAV_obs_array = np.array(next_UAV_obs)
@@ -975,22 +994,20 @@ for episode in range(num_episodes):
                     x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor
                 )
 
+                selected_customer = i  # 记录被选中的客户点编号
+                selected_customer_tensor = torch.tensor(selected_customer, dtype=torch.float32).unsqueeze(0).to(device)
+                # 执行一步动作
+                next_UAV_obs, reward_CA, done_CA, cost_CA = env.step_CA(assignment_action, selected_customer_tensor)
+                # 若本 episode 用于训练 PPO，则记录基于 CA 的时序奖励
                 if train_ppo_this_episode:
                     ppo.remember(
                         ppo_state,
                         uav_action,
                         log_prob,
-                        reward=0.0,
-                        done=False,
+                        reward=float(reward_CA),
+                        done=bool(done_CA),
                         value=value,
                     )
-
-                selected_customer = i  # 记录被选中的客户点编号
-                selected_customer_tensor = torch.tensor(selected_customer, dtype=torch.float32).unsqueeze(0).to(device)
-                # 执行一步动作
-                next_UAV_obs, reward_CA, done_CA, cost_CA = env.step_CA(assignment_action, selected_customer_tensor)
-                #reward_CA_tensor = torch.tensor(reward_CA, dtype=torch.float32).to(device)
-                #done_CA_tensor = torch.tensor(done_CA, dtype=torch.float32).to(device)
 
                 # 把next_UAV_obs转换为tensor
                 next_UAV_obs_array = np.array(next_UAV_obs)
@@ -1025,7 +1042,7 @@ for episode in range(num_episodes):
         # 根据obs选择动作
         maintenance_action, routing_action = maddpg.select_action(x_tensor, y_tensor, d_tensor, UAV_obs_tensor_i, selected_UAV)
 
-        # 执行一步动作
+        # 执行一步动作（仅用于 MADDPG，自身的奖励和成本）
         next_UAV_obs, rewards, done, cost = env.step(maintenance_action, routing_action , selected_UAV)
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32).to(device)
         done_tensor = torch.tensor(done, dtype=torch.float32).to(device)
@@ -1069,8 +1086,9 @@ for episode in range(num_episodes):
                             
             critic_loss, actor_loss = maddpg.update(**transition_dict)
 
-            writer.add_scalar('NO3_Losses/Critic Loss', critic_loss, step_counter)  # 记录critic_loss
-            writer.add_scalar('NO3_Losses/Actor Loss', actor_loss, step_counter)  # 记录actor_loss
+            # MADDPG 单步损失（按 step 记录）
+            writer.add_scalar('maddpg/critic_loss_step', critic_loss, step_counter)
+            writer.add_scalar('maddpg/actor_loss_step', actor_loss, step_counter)
 
             # 累加损失值到本episode
             episode_critic_loss += critic_loss  # 累加critic损失
@@ -1111,29 +1129,40 @@ for episode in range(num_episodes):
     episode_cost = total_cost
     episode_reward_b = -total_cost
 
-    # 如果本 episode 用于训练 PPO，则在 episode 结束后，用总成本构造 PPO 的回报并更新
+    # 如果本 episode 用于训练 PPO，则在 episode 结束后，基于时序 reward + 终止成本更新 PPO
     if train_ppo_this_episode and len(ppo.buffer.rewards) > 0:
-        num_steps = len(ppo.buffer.rewards)
-        # 把总成本均匀分配到本 episode 的每个 PPO 决策步，作为简单近似
-        step_reward = -float(episode_cost) / num_steps
-        ppo.buffer.rewards = [step_reward for _ in range(num_steps)]
+        # 先把 episode 总成本作为终止奖励的额外项加到最后一步：
+        # R_final = R_assign - λ * Cost_path
+        episode_cost_scalar = float(episode_cost.item() if hasattr(episode_cost, "item") else episode_cost)
+        ppo.buffer.rewards[-1] += -ppo_terminal_cost_weight * episode_cost_scalar
+
+        # 在清空 buffer 之前，先统计本局 PPO 的奖励信息（包括上面的终止成本项）
+        ppo_rewards_arr = np.array(ppo.buffer.rewards, dtype=np.float32)
+        ppo_mean_reward = float(ppo_rewards_arr.mean())
+        ppo_total_reward = float(ppo_rewards_arr.sum())
+        ppo_num_steps = int(ppo_rewards_arr.shape[0])
+
+        writer.add_scalar('ppo/mean_step_reward', ppo_mean_reward, episode)
+        writer.add_scalar('ppo/total_step_reward', ppo_total_reward, episode)
+        writer.add_scalar('ppo/num_steps', ppo_num_steps, episode)
+
+        # 确保序列最后一步被标记为终止（用于 GAE/回报计算）
         ppo.buffer.is_terminals[-1] = True
         ppo.update()
 
-    for i, reward in enumerate(UAV_rewards):
-        #writer.add_scalar(f'UAV_Rewards/UAV{i+1}', reward, episode)
-        writer.add_scalars(
-            'NO2_UAV_Rewards',  # 图表名称
-            {f'UAV{i+1}': reward for i, reward in enumerate(UAV_rewards)},  # 奖励字典
-            episode  # 当前轮次作为横轴
-        )
+    # 每个 episode 各 UAV 的总奖励
+    writer.add_scalars(
+        'episode/uav_rewards',
+        {f'UAV{i+1}': reward for i, reward in enumerate(UAV_rewards)},
+        episode
+    )
 
-    # 记录reward、critic_loss和actor_loss到TensorBoard
-    writer.add_scalar('NO1_C & R/Reward', episode_reward, episode)
-    writer.add_scalar('NO1_C & R/Cost', episode_cost, episode)
-    writer.add_scalar('NO1_C & R/Reward_b', episode_reward_b, episode)
-    writer.add_scalar('NO4_Episode Losses/Episode Critic Loss', episode_critic_loss, episode)
-    writer.add_scalar('NO4_Episode Losses/Episode Actor Loss', episode_actor_loss, episode) 
+    # 每个 episode 的总 reward / cost 以及累积损失
+    writer.add_scalar('episode/total_reward', episode_reward, episode)
+    writer.add_scalar('episode/total_cost', episode_cost, episode)
+    writer.add_scalar('episode/neg_total_cost', episode_reward_b, episode)
+    writer.add_scalar('episode/critic_loss_sum', episode_critic_loss, episode)
+    writer.add_scalar('episode/actor_loss_sum', episode_actor_loss, episode) 
 
     print(f"Episode {episode} finished. Total Reward: {episode_reward}, Critic Loss: {episode_critic_loss}, Actor Loss: {episode_actor_loss}, Cost:{episode_cost.item():.4f}")
 
@@ -1178,13 +1207,14 @@ for episode in range(num_episodes):
             for i, param in enumerate(maddpg.critic.parameters()):
                 f.write(f"Critic Param {i}: {param.data.tolist()}\n")
 
-    # 将 episode_cost 添加到 recent_costs 列表中
-    recent_costs.append(episode_cost)
-    if len(recent_costs) > 10:  # 保证 recent_costs 的长度为 10
+    # 将 episode_cost 添加到 recent_costs 列表中（转为标量以便收敛判断）
+    _cost = float(episode_cost.item() if hasattr(episode_cost, 'item') else episode_cost)
+    recent_costs.append(_cost)
+    if len(recent_costs) > convergence_window:  # 保持长度为 convergence_window
         recent_costs.pop(0)
 
-    # 检查最近 10 个 cost 是否收敛
-    if len(recent_costs) == 10 and (max(recent_costs) - min(recent_costs) <= 0.001):
+    # 检查最近 N 个 cost 是否收敛
+    if len(recent_costs) >= convergence_window and (max(recent_costs) - min(recent_costs) <= convergence_threshold):
         print(f"第{samp_number}批客户在第 {episode} 次 episode 收敛，开始下一轮训练。")
 
         # 记录收敛的 episode 到日志文件
@@ -1197,12 +1227,14 @@ for episode in range(num_episodes):
         # 重置 recent_costs，用于下一轮收敛判断
         recent_costs = []
 
-    """
-    # 检查是否所有批次都已经收敛
-    if samp_number > max_samp_number:  # 如果已经完成所有批次客户点训练
-        print("所有批次的客户点已经收敛，提前停止训练。")
-        done = True  # 结束训练
-    """
+        # 若启用“收敛即结束”，则提前退出训练循环
+        if convergence_early_stop:
+            print("已满足收敛条件，提前结束训练。")
+            break
+
+    # 达到最大 episode 数时正常结束（由 for 循环边界保证，此处可做日志）
+    if (episode + 1) >= max_episodes:
+        print(f"已达到最大训练轮数 {max_episodes}，结束训练。")
 
 # 训练结束，记录总训练时长
 train_end_time = time.time()
@@ -1215,6 +1247,20 @@ with open(log_file_path, 'a') as f:
 # 训练结束后关闭TensorBoard writer
 writer.close()
 
+# 输出并记录损坏事件与动态新客户事件
+events_path = os.path.join('D:\\coding\\result', 'events.txt')
+with open(events_path, 'w', encoding='utf-8') as f:
+    f.write("==== Broken events ====\n")
+    f.write(f"Total broken events: {len(env.broken_events)}\n")
+    for ev in env.broken_events:
+        f.write(str(ev) + "\n")
+    f.write("\n==== Dynamic customer events ====\n")
+    f.write(f"Total dynamic customer events: {len(env.dynamic_customer_events)}\n")
+    for ev in env.dynamic_customer_events:
+        f.write(str(ev) + "\n")
+
+print(f"Broken and dynamic customer events have been saved to: {events_path}")
+
 # 最终打印每台无人机的完整飞行路线和总reward
 for i in range(num_UAVs):
     print(f'UAV{i + 1} routes: {"-".join(map(str, UAV_routes[i]))}, UAV{i + 1} reward: {UAV_rewards[i]}')
@@ -1222,8 +1268,8 @@ for i in range(num_UAVs):
 print(f'Total reward: {total_reward}')
 print(f'Episode rewards: {episode_rewards}')
 
-# 绘制奖励图
-plt.plot(range(1, num_episodes + 1), episode_rewards, label="Total Reward per Episode")  # 确保添加 label
+# 绘制奖励图（实际训练轮数可能因提前收敛而小于 max_episodes）
+plt.plot(range(1, len(episode_rewards) + 1), episode_rewards, label="Total Reward per Episode")
 plt.xlabel('Episode')
 plt.ylabel('Total Reward')
 plt.title('Total Rewards over Episodes')

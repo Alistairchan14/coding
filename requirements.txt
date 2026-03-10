@@ -1,0 +1,27 @@
+# PPO+MADDPG.py & environment_up.py 依赖
+# Python 3.8+ 推荐
+#
+# 若需使用 GPU（CUDA 12.6）：
+#   先单独安装带 CUDA 12 的 PyTorch（与 12.6 驱动兼容），再安装下面依赖：
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   然后：pip install -r requirements.txt
+
+# 数值计算
+numpy>=1.21.0,<3.0.0
+
+# 深度学习与强化学习
+torch>=1.12.0
+tensorboard>=2.8.0
+
+# 机器学习工具
+scikit-learn>=1.0.0
+
+# 科学计算
+scipy>=1.7.0
+
+# 强化学习环境
+gym>=0.21.0
+
+# 可视化
+matplotlib>=3.5.0
+seaborn>=0.11.0
