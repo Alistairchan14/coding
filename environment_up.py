@@ -1,6 +1,3 @@
-#pip install scipy
-#pip install gym
-#pip install seaborn
 from typing import Tuple
 import numpy as np
 import matplotlib.pyplot as plt
@@ -16,7 +13,7 @@ import math
 
 #参数设置   （全都丢进config）
 num_UAVs = 3
-num_customers = 20
+num_customers = 10
 fix_v = 60
 c_electricity = 0.6  # 配送成本参数（电价）
 c_fix = 100  # 维修成本参数
@@ -28,15 +25,15 @@ max_energy = energy_parameter * (100 + max_UAVs_load) ** (3/2) * (20/fix_v) * 0.
 
 #搭建环境
 class Environment(gym.Env): 
-    def __init__(self, num_UAVs, num_customers):
+    def __init__(self, num_UAVs, num_customers, quiet=False):
         super(Environment, self).__init__()
+        self.quiet = quiet  # True 时不弹窗、不刷屏打印，供 MADDPG 等脚本调用
 
         self.num_UAVs = num_UAVs
         self.num_customers = num_customers
         
         self.UAVs_positions = np.zeros((num_UAVs, 2))  # 无人机起始位置在原点（0，0）
         self.fix_v = fix_v
-        self.max_energy = max_energy
         self.max_UAVs_load = max_UAVs_load
 
         self.seed_pool = [i for i in range(5200, 120000, 1)]  # 种子池 range(start, end, step)
@@ -47,18 +44,16 @@ class Environment(gym.Env):
 
         # 定义常规配置参数
         self.config = self._initialize_config()
+        self.max_energy = self.config['max_energy']
+        self.min_energy = self.config['min_energy']
 
         # 计算距离矩阵
         self.distance_matrix = self._calculate_distance_matrix()
 
-        # 打印距离矩阵
-        self._print_distance_matrix()
-
-        # 打印客户需求
-        self._print_customer_cargo_demands()
-
-        # 打印客户需求和显示客户位置图
-        self._plot_customer_positions_with_demands()
+        if not self.quiet:
+            self._print_distance_matrix()
+            self._print_customer_cargo_demands()
+            self._plot_customer_positions_with_demands()
 
         
         # 定义状态空间UAV
@@ -97,11 +92,16 @@ class Environment(gym.Env):
         obs_dim = 8 + num_customers  # 8个UAV状态 + 6个客户状态
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
-        # 打印UAV和客户状态空间
-        self._print_state_spaces()
+        if not self.quiet:
+            self._print_state_spaces()
 
         # 设置打印选项以调整数字精度
         np.set_printoptions(precision=2, suppress=True)
+
+        # 事件日志结构
+        self.broken_events = []            # 记录无人机损坏事件
+        self.dynamic_customer_events = []  # 记录动态新客户出现事件
+        self.current_episode = 0           # 由训练主循环在每个 episode 开始时设置
 
     def generate_customer_positions(self,seed):
         "生成客户点坐标"
@@ -127,14 +127,79 @@ class Environment(gym.Env):
         np.random.seed(seed)
         customer_cargo_demands = np.round(np.random.uniform(0, 45, size=self.num_customers), 2) #随机生成客户需求 [10,30)
         return customer_cargo_demands
+
+    def _sample_single_customer_position(self):
+        """按与 generate_customer_positions 相同的分布采样单个客户坐标"""
+        r = 10 * np.sqrt(np.random.rand())
+        theta = 2 * np.pi * np.random.rand()
+        x = round(r * np.cos(theta), 2)
+        y = round(r * np.sin(theta), 2)
+        return x, y
+
+    def _sample_single_customer_demand(self):
+        """按与 generate_customer_cargo_demands 相同的分布采样单个客户需求"""
+        return float(np.round(np.random.uniform(0, 45), 2))
+
+    def _maybe_spawn_new_customers(self):
+        """
+        动态客户到达逻辑：
+        - 找到已经“完全空闲”的客户槽（所有 UAV 行均为 2 或 -1，表示该槽对应的历史任务已结束）
+        - 以 dynamic_customer_prob 的概率，在这些槽中最多生成 dynamic_max_new_per_step 个新客户
+        - 新客户的位置和需求按原始分布重新采样，状态重置为 0（未分配）
+        - 更新 distance_matrix 以反映位置变化
+        """
+        prob = self.config.get('dynamic_customer_prob', 0.0)
+        max_new = self.config.get('dynamic_max_new_per_step', 0)
+        if prob <= 0.0 or max_new <= 0:
+            return
+
+        # 候选槽：所有 UAV 行在该列上的值都属于 {2, -1}，表示旧任务已完成/失效
+        candidates = []
+        for j in range(self.num_customers):
+            col = self.customer_state_space[:, j]
+            if np.all(np.isin(col, [2, -1])):
+                candidates.append(j)
+
+        if not candidates:
+            return
+
+        np.random.shuffle(candidates)
+        new_count = 0
+        for j in candidates:
+            if new_count >= max_new:
+                break
+            if np.random.rand() < prob:
+                # 重新采样该槽对应客户的位置与需求
+                x, y = self._sample_single_customer_position()
+                d = self._sample_single_customer_demand()
+                self.customer_positions[j] = np.array([x, y])
+                self.customer_cargo_demands[j] = d
+                # 重置该槽的客户状态为 0（未分配、尚未出现的客户，将在 CA 阶段被逐步分配）
+                self.customer_state_space[:, j] = 0
+                # 记录动态新客户事件
+                self.dynamic_customer_events.append({
+                    "episode": int(self.current_episode),
+                    "step": int(self.current_step),
+                    "customer_index": int(j),
+                    "x": float(x),
+                    "y": float(y),
+                    "demand": float(d)
+                })
+                new_count += 1
+
+        # 若产生了新客户，重新计算距离矩阵
+        if new_count > 0:
+            self.distance_matrix = self._calculate_distance_matrix()
     
     def update_seed(self):
-        "切换到下一个种子，更新客户点"
-        self.current_seed_index = (self.current_seed_index + 1) % len(self.seed_pool)  # 循环遍历种子池
+        """切换到下一个种子，更新客户点与需求，并重新计算距离矩阵。"""
+        self.current_seed_index = (self.current_seed_index + 1) % len(self.seed_pool)
         new_seed = self.seed_pool[self.current_seed_index]
         self.customer_positions = self.generate_customer_positions(new_seed)
         self.customer_cargo_demands = self.generate_customer_cargo_demands(new_seed)
-        print(f"切换到种子: {new_seed}, 新的客户信息已更新。")
+        self.distance_matrix = self._calculate_distance_matrix()
+        if not self.quiet:
+            print(f"切换到种子: {new_seed}, 新的客户信息已更新。")
 
 
     #随机生成客户点坐标+需求，return x,y,d,customer_list
@@ -238,9 +303,14 @@ class Environment(gym.Env):
             'a': 100000,
             'p': 30,
             'energy_parameter': 18,  # 电量计算参数
+            'max_energy': max_energy,  # 无人机最大能量（与顶部参数一致，可在 config 中覆盖）
+            'min_energy': 0.5,        # 无人机最小能量阈值，低于此值不允许飞往新客户（安全余量）
             'weibull_shape': 1.5,  # 威布尔分布的形状参数
             'weibull_scale': 100,  # 威布尔分布的尺度参数
-            'weibull_function': lambda size=None: weibull_min(config['weibull_shape'], config['weibull_scale'], size)
+            'weibull_function': lambda size=None: weibull_min(config['weibull_shape'], config['weibull_scale'], size),
+            # 动态客户到达：每步为每个“已完成客户槽”生成新客户的概率及上限
+            'dynamic_customer_prob': 0.1,       # 单个候选槽在一步中产生新客户的概率
+            'dynamic_max_new_per_step': 2       # 每步最多产生的新客户数
         }
         return config
     
@@ -308,27 +378,10 @@ class Environment(gym.Env):
         self.current_step = 0  # 重置当前时间步
         self.done = False  # 重置 done 标志
         self.total_reward = 0  # 重置累计奖励
-    
-        # 重新计算距离矩阵
-        # self.distance_matrix = distance_matrix
-    
-        # 打印重置后的状态和距离矩阵
-        print("\nReset completed.")
-    
-        print("\nUAV States After Reset:")
-        for key, value in self.UAV_state.items():
-            print(f"{key}: {value}")
-    
-        print("\nCustomer State Space After Reset:")
-        print(self.customer_state_space)
-    
-        #print("\nDistance Matrix:")
-        #print(self.distance_matrix)
 
         # 3. 生成并返回初始观测
         UAV_obs = []
         for i in range(self.num_UAVs):
-            # 获取 UAV_state 中第 i 台无人机的数据
             position = self.UAV_state["1_position"][i, 0]
             destination = self.UAV_state["2_destination"][i, 0]
             arrival_time = self.UAV_state["3_arrival_time"][i, 0]
@@ -337,37 +390,40 @@ class Environment(gym.Env):
             age = self.UAV_state["6_age"][i, 0]
             broken = self.UAV_state["7_broken"][i, 0]
             decision_time = self.UAV_state["8_decision_time"][i, 0]
-            
-            # 获取 customer_state_space 中第 i 行的数据
             customer_state = self.customer_state_space[i, :]
-            
-            # 组合观测数据
             o_1 = np.array([
-                position,
-                destination,
-                arrival_time,
-                load,
-                energy,
-                age,
-                broken,
-                decision_time
+                position, destination, arrival_time, load, energy, age, broken, decision_time
             ])
-            o_2 = np.array([
-                *customer_state  # 追加 customer_state 中的元素
-            ])
+            o_2 = np.array([*customer_state])
             o = np.concatenate([o_1, o_2])
             UAV_obs.append(o)
-
             UAV_obs_matrix = np.vstack(UAV_obs)
             self.UAV_obs_matrix = UAV_obs_matrix
 
-            # 打印观测数据
-            print(f"UAV {i+1} Observation: {o}")
-            print(f"UAV_obs: {UAV_obs}")
-            print(f"UAV_obs: {type(UAV_obs)}")
-            print(f"UAV_obs_matrix: {UAV_obs_matrix}")
-            print(f"UAV_obs_matrix: {type(UAV_obs_matrix)}")
-            
+        if not self.quiet:
+            print("\nReset completed.")
+            print("Customer State Space After Reset:\n", self.customer_state_space)
+
+        return UAV_obs
+
+    def _refresh_UAV_obs(self):
+        """根据当前 UAV_state 和 customer_state_space 重新生成观测并更新 UAV_obs_matrix，返回观测列表。"""
+        UAV_obs = []
+        for i in range(self.num_UAVs):
+            position = self.UAV_state["1_position"][i, 0]
+            destination = self.UAV_state["2_destination"][i, 0]
+            arrival_time = self.UAV_state["3_arrival_time"][i, 0]
+            load = self.UAV_state["4_load"][i, 0]
+            energy = self.UAV_state["5_energy"][i, 0]
+            age = self.UAV_state["6_age"][i, 0]
+            broken = self.UAV_state["7_broken"][i, 0]
+            decision_time = self.UAV_state["8_decision_time"][i, 0]
+            customer_state = self.customer_state_space[i, :]
+            o_1 = np.array([position, destination, arrival_time, load, energy, age, broken, decision_time])
+            o_2 = np.array([*customer_state])
+            o = np.concatenate([o_1, o_2])
+            UAV_obs.append(o)
+        self.UAV_obs_matrix = np.vstack(UAV_obs)
         return UAV_obs
 
     def selected_UAV(self):
@@ -393,6 +449,23 @@ class Environment(gym.Env):
         else:
             return -1  # 如果没有有效索引，返回None或处理其他情况
 
+    def replace_broken_uav_with_new(self, uav_id):
+        """
+        新机替换策略：当某架无人机故障时，用一架新机替代，继承其未完成任务（-1 恢复为 1），
+        状态重置为初始（位置 0、电量满、役龄 0、未损坏）。用于无 PPO 的 MADDPG 单独训练场景。
+        """
+        self.UAV_state["1_position"][uav_id, 0] = 0
+        self.UAV_state["2_destination"][uav_id, 0] = 0
+        self.UAV_state["3_arrival_time"][uav_id, 0] = 0.0
+        self.UAV_state["4_load"][uav_id, 0] = 0.0
+        self.UAV_state["5_energy"][uav_id, 0] = 100.0
+        self.UAV_state["6_age"][uav_id, 0] = 0.0
+        self.UAV_state["7_broken"][uav_id, 0] = 0
+        self.UAV_state["8_decision_time"][uav_id, 0] = 0.0
+        self.customer_state_space[uav_id, :] = np.where(
+            self.customer_state_space[uav_id, :] == -1, 1, self.customer_state_space[uav_id, :]
+        )
+        self._refresh_UAV_obs()
 
     def step(self, maintenance_action, routing_action , selected_UAV):
 
@@ -468,6 +541,7 @@ class Environment(gym.Env):
             UAV["6_age"][selected_UAV] = 0
 
         # 更新7 broken 状态
+        prev_broken = int(UAV["7_broken"][selected_UAV])  # 记录更新前的损坏状态
         if maintenance_action.item() == 1:
             #UAV["7_broken"][selected_UAV] = np.random.choice([0, 1], p=[0.99, 0.01])
             R = weibull_reliability(UAV["6_age"][selected_UAV], k, lambda_)
@@ -478,6 +552,18 @@ class Environment(gym.Env):
                 UAV["7_broken"][selected_UAV] = 0
         else:
             UAV["7_broken"][selected_UAV] = 0 #只要维修了就一定不会坏
+
+        # 如果本次 step 让该 UAV 从未损坏变成损坏，记录事件
+        if prev_broken == 0 and UAV["7_broken"][selected_UAV] == 1:
+            self.broken_events.append({
+                "episode": int(self.current_episode),
+                "step": int(self.current_step),
+                "uav_id": int(selected_UAV),
+                "position": float(UAV["1_position"][selected_UAV]),
+                "destination": float(UAV["2_destination"][selected_UAV]),
+                "age": float(UAV["6_age"][selected_UAV]),
+                "energy": float(UAV["5_energy"][selected_UAV])
+            })
 
         # 更新8 decision_time 状态
         if UAV["7_broken"][selected_UAV] == 0:
@@ -526,6 +612,9 @@ class Environment(gym.Env):
                 self.UAV_state["7_broken"][i] = self.UAV_state["7_broken"][i]
                 self.UAV_state["8_decision_time"][i] = self.UAV_state["8_decision_time"][i]
         
+        # 在任务状态更新之后，可能产生新的动态客户
+        self._maybe_spawn_new_customers()
+
         # 计算奖励
         #配送成本（E-E'）（1-b）c
         delivery_cost = (self.config['energy_parameter'] * load_factor * UAV["3_arrival_time"][selected_UAV] * 0.001) * (1 - UAV["7_broken"][selected_UAV]) * self.config['c_electricity']
@@ -582,15 +671,9 @@ class Environment(gym.Env):
             ])
             new_o = np.concatenate([o_3, o_4])
             new_UAV_obs.append(new_o)
-            # 打印观测数据
-            print(f"UAV {i+1} Observation: {new_o}")
-            
-            
-        print(type(selected_UAV))
-        # 打印更新后的状态观测
-        print("Updated UAV Observations:")
-        for i, obs in enumerate(new_UAV_obs):
-            print(f"UAV {i+1} Observation: {obs}")
+        if not self.quiet:
+            for i, obs in enumerate(new_UAV_obs):
+                print(f"UAV {i+1} Observation: {obs}")
 
         new_UAV_obs_matrix = np.vstack(new_UAV_obs)
 
@@ -616,7 +699,8 @@ class Environment(gym.Env):
         UAV = self.UAV_state
 
         selected_customer = int(selected_customer.item())  # 将 selected_customer 转换为整数
-        self.customer_state_space[:, selected_customer] = CA_action.cpu().detach().numpy()  # 更新客户状态空间
+        ca_action_np = CA_action.cpu().detach().numpy()
+        self.customer_state_space[:, selected_customer] = ca_action_np  # 更新客户状态空间
 
         # 获取更新后的状态观测
         new_UAV_obs = []
@@ -650,24 +734,30 @@ class Environment(gym.Env):
             ])
             new_o = np.concatenate([o_3, o_4])
             new_UAV_obs.append(new_o)
-            # 打印观测数据
-            print(f"UAV {i+1} Observation: {new_o}")
-            
-            
-        # 打印更新后的状态观测
-        print("Updated UAV Observations:")
-        for i, obs in enumerate(new_UAV_obs):
-            print(f"UAV {i+1} Observation: {obs}")
+        if not self.quiet:
+            for i, obs in enumerate(new_UAV_obs):
+                print(f"UAV {i+1} Observation: {obs}")
 
         new_UAV_obs_matrix = np.vstack(new_UAV_obs)
 
         # 更新全局观测
         self.UAV_obs_matrix = new_UAV_obs_matrix
 
-        # 累计奖励
-        #self.total_reward += reward
-        reward_CA = 0  # CA动作没有奖励
-        cost_CA = 0  # CA动作没有成本
+        # 基于当前分配计算一个简单的局部成本和奖励：
+        # 取被分配到该客户的 UAV，使其当前位置到该客户点的距离作为分配成本，
+        # 奖励为负的距离，以鼓励“近的 UAV 服务近的客户”。
+        try:
+            assigned_uav = int(np.argmax(ca_action_np))
+            # UAV 当前所在节点索引（0 = 仓库，1..num_customers = 客户）
+            current_node = int(UAV["1_position"][assigned_uav])
+            customer_node = selected_customer + 1  # 客户节点在距离矩阵中的索引
+            distance = float(self.distance_matrix[current_node, customer_node])
+            cost_CA = distance
+            reward_CA = -distance
+        except Exception:
+            # 若出现异常（例如没有有效的一热向量），退化为 0 成本/奖励，保持稳定
+            cost_CA = 0.0
+            reward_CA = 0.0
 
         # 增加步数
         self.current_step += 1
@@ -747,8 +837,8 @@ class Environment(gym.Env):
                     energy_to_j = energy - self.config['energy_parameter'] * load_to_j * arrival_time_to_j * 0.001 // self.config['max_energy']  # 到达j的电量
                     energy_to_warehouse = energy_to_j - self.config['energy_parameter'] * load_to_j * arrival_time_to_warehouse * 0.001 // self.config['max_energy']  # 返回仓库的电量
 
-                    # 如果电量不足，则屏蔽该客户点
-                    if energy_to_warehouse <= 0:
+                    # 如果电量不足（低于 min_energy 阈值），则屏蔽该客户点
+                    if energy_to_warehouse <= self.min_energy:
                         mask[j] = False
             
             masks.append(mask)
