@@ -7,8 +7,10 @@ import gym
 import random
 from gym import spaces
 from scipy.stats import weibull_min
-from scipy.integrate import quad
 import math
+from numpy.polynomial.legendre import leggauss
+
+_GL_NODES_16, _GL_WEIGHTS_16 = leggauss(16)
 
 
 #参数设置   （全都丢进config）
@@ -220,77 +222,7 @@ class Environment(gym.Env):
         all_positions = np.vstack([warehouse_position, self.customer_positions])
         # 计算距离矩阵
         distance_matrix = np.linalg.norm(all_positions[:, np.newaxis] - all_positions, axis=2)
-        return distance_matrix
-    
-    """
-    def old_customer_state_space(self):
-        from CVRPGA import CVRP
-        from CVRPGA import GeneticAlgorithm
-        x, y, d = self.customer_list()
-        # 定义仓库（0，0），需求为 0
-        warehouse = {'customer_id': 0, 'coordinate': (0, 0), 'demand': 0}
-
-        # 随机生成 num_customers 个客户，坐标 (x, y) 在 10 以内，需求在 50kg 以内
-        customer_list = [warehouse]  # 初始化客户列表，包含仓库
-        for i in range(num_customers):  
-            customer = {
-                'customer_id': i+1,
-                'coordinate': (x[i][0], y[i][0]),  # 随机坐标
-                'demand': d[i][0]  # 随机需求
-            }
-            customer_list.append(customer)
-
-        # 打印生成的客户列表以便查看
-        print("随机生成的客户列表:")
-        for customer in customer_list:
-            print(customer)
-
-        # 创建CVRP问题实例
-        cvrp = CVRP(customer_list)
-        # 初始化一个遗传算法实例，传入CVRP问题实例
-        ga = GeneticAlgorithm(cvrp)
-        assignment_matrix_np = ga.run()
-        return assignment_matrix_np
-    
-    def new_customer_state_space(self):
-        assignment_matrix_np = self.old_customer_state_space()
-        
-        # 获取矩阵行数和列数
-        hang, lie = assignment_matrix_np.shape
-        
-        # 第一种情况：多余的行数分配到前 num_UAVs 行，优先分配给 1 最少的行
-        if hang > num_UAVs:
-            # 初始化前 num_UAVs 行的矩阵
-            new_matrix = np.zeros((num_UAVs, lie), dtype=int)
-            # 将前 num_UAVs 行直接复制到 new_matrix
-            new_matrix[:num_UAVs] = assignment_matrix_np[:num_UAVs]
-            
-            # 遍历多余的行
-            for i in range(num_UAVs, hang):
-                # 获取每一行当前的 1 的数量
-                row_sums = new_matrix.sum(axis=1)
-                # 找到 1 最少的行索引
-                min_indices = np.where(row_sums == row_sums.min())[0]
-                # 如果有多行 1 的数量相同，随机选择一行
-                target_row = min_indices[0]
-                # 将当前行的任务（1 值）分配到目标行
-                new_matrix[target_row] |= assignment_matrix_np[i]
-
-            return new_matrix
-        
-        # 第二种情况：行数与num_UAVs相同，无需修改
-        elif hang == num_UAVs:
-
-            return assignment_matrix_np
-        
-        # 第三种情况：增加行数，补零到num_UAVs行
-        else:  # hang < num_UAVs
-            padding = np.zeros((num_UAVs - hang, lie), dtype=int)
-            new_matrix = np.vstack((assignment_matrix_np, padding))
-
-            return new_matrix
-        """
-        
+        return distance_matrix        
 
     
     def weibull_distribution(shape, scale, size=None):
@@ -518,10 +450,16 @@ class Environment(gym.Env):
 
             k = self.config['weibull_shape']
             lambda_ = self.config['weibull_scale']
-            #分子计算
-            h = UAV["3_arrival_time"][selected_UAV]
-            age = UAV["6_age"][selected_UAV]
-            integral, _ = quad(lambda tau: tau * weibull_pdf(age + tau, k, lambda_), 0, h)
+            h = float(UAV["3_arrival_time"][selected_UAV])
+            age = float(UAV["6_age"][selected_UAV])
+            # 16-point Gauss-Legendre quadrature (replaces scipy.integrate.quad)
+            mid = h / 2.0
+            gl_tau = mid * _GL_NODES_16 + mid
+            gl_t = age + gl_tau
+            gl_pdf = np.where(gl_t >= 0,
+                              (k / lambda_) * (gl_t / lambda_) ** (k - 1) * np.exp(-(gl_t / lambda_) ** k),
+                              0.0)
+            integral = float(mid * np.sum(_GL_WEIGHTS_16 * gl_tau * gl_pdf))
 
             #分母计算
             reliability_start = weibull_reliability(age, k, lambda_)

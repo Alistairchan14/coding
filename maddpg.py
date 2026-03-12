@@ -5,6 +5,7 @@ MADDPG 独立模块：便于单独调试 MADDPG 算法。
 """
 import os
 import time
+import json
 os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 
 import numpy as np
@@ -37,12 +38,30 @@ class ActorNetwork(nn.Module):
         self.env = env
         self.num_customers = num_customers
 
-        # 仅用 UAV_obs，不再单独输入客户点 xyd（UAV_obs 中已含足够信息）
         self.fc1 = nn.Linear(obs_dim, 128)
         self.fc2 = nn.Linear(128, 128)
         self.maintenance_out = nn.Linear(128, 1)
         self.maintenance_activation = nn.Sigmoid()
         self.routing_out = nn.Linear(128, num_customers + 1)
+
+        self._env_cache_version = -1
+        if env is not None:
+            self._cache_env_tensors()
+
+    def _cache_env_tensors(self):
+        env = self.env if self.env is not None else _default_env
+        if env is None:
+            return
+        self._c_demands = torch.tensor(env.customer_cargo_demands, dtype=torch.float32, device=device)
+        self._c_dist_matrix = torch.tensor(env.distance_matrix, dtype=torch.float32, device=device)
+        self._c_max_load = torch.tensor(env.max_UAVs_load, dtype=torch.float32, device=device)
+        self._c_fix_v = torch.tensor(env.fix_v, dtype=torch.float32, device=device)
+        self._c_energy_param = torch.tensor(env.config['energy_parameter'], dtype=torch.float32, device=device)
+        self._c_max_energy = torch.tensor(env.max_energy, dtype=torch.float32, device=device)
+        self._c_min_energy = torch.tensor(env.min_energy, dtype=torch.float32, device=device)
+        self._c_cust_nodes = torch.arange(1, self.num_customers + 1, device=device)
+        self._c_broken_mask_row = torch.tensor([True] + [False] * self.num_customers, dtype=torch.bool, device=device)
+        self._env_cache_version += 1
 
     def forward(self, UAV_obs_tensor_i, selected_UAV):
         UAV_obs_tensor_i = UAV_obs_tensor_i.to(device)
@@ -61,56 +80,48 @@ class ActorNetwork(nn.Module):
         return maintenance_action, routing_probs
 
     def get_UAV_action_mask(self, UAV_obs_tensor_i):
-        env = self.env if self.env is not None else _default_env
-        if env is None:
-            raise RuntimeError("ActorNetwork 需要 env（或设置 maddpg._default_env）以计算 action mask")
+        if not hasattr(self, '_c_demands') or self._env_cache_version < 0:
+            env = self.env if self.env is not None else _default_env
+            if env is None:
+                raise RuntimeError("ActorNetwork 需要 env（或设置 maddpg._default_env）以计算 action mask")
+            self._cache_env_tensors()
 
-        UAV_obs_tensor_i = UAV_obs_tensor_i.to(device)
         num_customers = self.num_customers
-        is_batch = len(UAV_obs_tensor_i.shape) == 2
-        if is_batch:
-            num_batch, num_feature = UAV_obs_tensor_i.shape
-        else:
-            num_batch = 1
-            UAV_obs_tensor_i = UAV_obs_tensor_i.unsqueeze(0).to(device)
-            num_feature = UAV_obs_tensor_i.shape[1]
+        is_batch = UAV_obs_tensor_i.dim() == 2
+        if not is_batch:
+            UAV_obs_tensor_i = UAV_obs_tensor_i.unsqueeze(0)
+        num_batch = UAV_obs_tensor_i.size(0)
 
         customer_sequences = UAV_obs_tensor_i[:, -num_customers:]
-        masks = torch.zeros((num_batch, num_customers + 1), dtype=torch.bool).to(device)
+        masks = torch.zeros((num_batch, num_customers + 1), dtype=torch.bool, device=device)
         masks[:, 0] = True
 
-        energy = UAV_obs_tensor_i[:, 4].to(device)
-        broken = UAV_obs_tensor_i[:, 6].to(device)
-        load = UAV_obs_tensor_i[:, 3].to(device)
-        destination = UAV_obs_tensor_i[:, 1].long().to(device)
+        energy = UAV_obs_tensor_i[:, 4]
+        broken = UAV_obs_tensor_i[:, 6]
+        load = UAV_obs_tensor_i[:, 3]
+        destination = UAV_obs_tensor_i[:, 1].long()
 
-        customer_cargo_demands = torch.tensor(env.customer_cargo_demands).to(device)
-        distance_matrix = torch.tensor(env.distance_matrix).to(device)
-        max_UAVs_load = torch.tensor(env.max_UAVs_load).to(device)
-        fix_v = torch.tensor(env.fix_v).to(device)
-        energy_parameter = torch.tensor(env.config['energy_parameter']).to(device)
-        max_energy = torch.tensor(env.max_energy).to(device)
-        min_energy = torch.tensor(env.min_energy).to(device)
-
-        masks[broken == 1] = torch.tensor([True] + [False] * num_customers, dtype=torch.bool).to(device)
         masks[:, 1:] = (customer_sequences == 1)
         masks[destination == 0, 0] = False
+        masks[broken == 1] = self._c_broken_mask_row
 
-        for j in range(1, num_customers + 1):
-            demand_j = customer_cargo_demands[j - 1]
-            arrival_time_to_j = distance_matrix[destination, j] / fix_v
-            arrival_time_to_warehouse = distance_matrix[j, 0] / fix_v
-            load_to_j = (100 + load + demand_j) ** (3 / 2)
-            energy_to_j = energy - energy_parameter * load_to_j * arrival_time_to_j * 0.1 / max_energy
-            energy_to_warehouse = energy_to_j - energy_parameter * load_to_j * arrival_time_to_warehouse * 0.1 / max_energy
-            masks[:, j] &= (load + demand_j <= max_UAVs_load) & (energy_to_warehouse > min_energy)
+        # Vectorized energy/load feasibility check for all customers at once
+        demands = self._c_demands
+        cust_nodes = self._c_cust_nodes
+        dist_to_cust = self._c_dist_matrix[destination][:, cust_nodes]
+        arrival_to_j = dist_to_cust / self._c_fix_v
+        arrival_to_wh = self._c_dist_matrix[cust_nodes, 0] / self._c_fix_v
 
-        if is_batch:
-            masks = masks
-        else:
+        load_factor_fwd = (100 + load).unsqueeze(1) ** 1.5
+        load_factor_back = (100 + load.unsqueeze(1) + demands.unsqueeze(0)) ** 1.5
+        e_at_j = energy.unsqueeze(1) - self._c_energy_param * load_factor_fwd * arrival_to_j * 0.001 / self._c_max_energy
+        e_at_wh = e_at_j - self._c_energy_param * load_factor_back * arrival_to_wh.unsqueeze(0) * 0.001 / self._c_max_energy
+
+        masks[:, 1:] &= ((load.unsqueeze(1) + demands.unsqueeze(0)) <= self._c_max_load) & (e_at_wh > self._c_min_energy)
+
+        if not is_batch:
             masks = masks.squeeze(0)
-        masks_tensor = masks.to(device)
-        return masks_tensor
+        return masks
 
 
 # ==========================
@@ -128,7 +139,8 @@ class CriticNetwork(nn.Module):
         self.out = nn.Linear(128, 1)
 
     def forward(self, UAV_obs, maintenance_action, routing_action, selected_UAV):
-        UAV_obs = UAV_obs.view(256, -1).to(device)
+        batch_size = UAV_obs.size(0)
+        UAV_obs = UAV_obs.view(batch_size, -1).to(device)
         maintenance_action = maintenance_action.to(device)
         routing_action = routing_action.to(device)
         selected_UAV = selected_UAV.to(device)
@@ -141,100 +153,171 @@ class CriticNetwork(nn.Module):
 
 
 # ==========================
-# 3. 经验回放 ReplayBuffer
+# 3. 经验回放 ReplayBuffer（基于 GMM 场景描述向量的分层采样）
 # ==========================
 class ReplayBuffer:
+    """
+    论文公式 (24)：场景描述向量 s = (num, x, y, d, sel)，
+    拟合 H 个高斯分量的 GMM p(s) = Σ α_h N(s|μ_h,Σ_h)，
+    按各分量覆盖比例做分层采样。
 
-    def __init__(self, capacity):
+    使用预分配 CPU 张量存储 + 环形缓冲区，实现 O(1) add 和批量 sample。
+    """
+
+    def __init__(self, capacity, n_gmm_components=5, gmm_refit_interval=1000):
         self.capacity = capacity
-        self.buffer = []
-        self.samp_counts = {}
+        self._size = 0
+        self._pos = 0
+        self._fields = None
+        self._scene_np = None
+        self.n_gmm_components = n_gmm_components
+        self.gmm_refit_interval = gmm_refit_interval
+        self._cached_labels = None
+        self._cached_n_comp = 1
+        self._samples_since_refit = 0
+        self._last_refit_size = 0
+        self._cached_comp_indices = {}
+        self._distinct_nums = set()
+        self._distinct_sels = set()
 
-    def add(self, samp_number_tensor, x_tensor, y_tensor, d_tensor, UVA_obs, maintenance_action, routing_action, reward, next_UAV_obs, done, selected_UAV):
-        experience = (samp_number_tensor, x_tensor, y_tensor, d_tensor, UVA_obs, maintenance_action, routing_action, reward, next_UAV_obs, done, selected_UAV)
-        samp_number = experience[0]
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(experience)
-            self.samp_counts[samp_number] = self.samp_counts.get(samp_number, 0) + 1
-        else:
-            removable = [
-                exp for exp in self.buffer
-                if self.samp_counts[exp[0]] > 200
-            ]
-            if removable:
-                removable.sort(key=lambda exp: exp[7])
-                to_remove = removable[0]
-                self.buffer.remove(to_remove)
-                self.samp_counts[to_remove[0]] -= 1
-            self.buffer.append(experience)
-            self.samp_counts[samp_number] = self.samp_counts.get(samp_number, 0) + 1
+    @staticmethod
+    def _to_scalar(x):
+        return x.item() if isinstance(x, torch.Tensor) and x.numel() == 1 else float(x)
+
+    @staticmethod
+    def _to_np(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy().ravel().astype(np.float32)
+        return np.asarray(x, dtype=np.float32).ravel()
+
+    def _build_scene(self, exp):
+        """s = (num, x, y, d, sel)"""
+        num = self._to_scalar(exp[0])
+        x = self._to_np(exp[1])
+        y = self._to_np(exp[2])
+        d = self._to_np(exp[3])
+        sel = self._to_scalar(exp[10])
+        return np.concatenate([[num], x, y, d, [sel]]).astype(np.float32)
+
+    def _init_storage(self, experience, scene):
+        self._fields = []
+        for item in experience:
+            if isinstance(item, torch.Tensor):
+                t = item.detach().cpu()
+            else:
+                t = torch.tensor(item, dtype=torch.float32)
+            self._fields.append(torch.zeros((self.capacity,) + t.shape, dtype=t.dtype))
+        self._scene_np = np.zeros((self.capacity, len(scene)), dtype=np.float32)
+
+    def add(self, samp_number_tensor, x_tensor, y_tensor, d_tensor,
+            UVA_obs, maintenance_action, routing_action, reward,
+            next_UAV_obs, done, selected_UAV):
+        experience = (samp_number_tensor, x_tensor, y_tensor, d_tensor,
+                      UVA_obs, maintenance_action, routing_action, reward,
+                      next_UAV_obs, done, selected_UAV)
+        scene = self._build_scene(experience)
+
+        if self._fields is None:
+            self._init_storage(experience, scene)
+
+        idx = self._pos
+        for f, item in enumerate(experience):
+            if isinstance(item, torch.Tensor):
+                self._fields[f][idx] = item.detach().cpu()
+            else:
+                self._fields[f][idx] = item
+        self._scene_np[idx] = scene
+
+        self._distinct_nums.add(self._to_scalar(experience[0]))
+        self._distinct_sels.add(self._to_scalar(experience[10]))
+
+        self._pos = (self._pos + 1) % self.capacity
+        self._size = min(self._size + 1, self.capacity)
+
+    def _need_refit(self):
+        size_changed = abs(self._size - self._last_refit_size) > self.gmm_refit_interval
+        return (self._cached_labels is None
+                or self._samples_since_refit >= self.gmm_refit_interval
+                or size_changed)
+
+    def _refit_gmm(self):
+        N = self._size
+        scene_array = self._scene_np[:N].astype(np.float64)
+
+        n_approx_unique = len(self._distinct_nums) * len(self._distinct_sels)
+        n_comp = max(1, min(self.n_gmm_components, n_approx_unique, N))
+
+        gmm = GaussianMixture(n_components=n_comp, covariance_type='diag',
+                               max_iter=30, random_state=42, reg_covar=1e-3)
+        try:
+            gmm.fit(scene_array)
+            self._cached_labels = gmm.predict(scene_array)
+            self._cached_n_comp = n_comp
+        except ValueError:
+            self._cached_labels = np.zeros(N, dtype=int)
+            self._cached_n_comp = 1
+
+        self._cached_comp_indices = {}
+        for h in range(self._cached_n_comp):
+            self._cached_comp_indices[h] = []
+        for i, h in enumerate(self._cached_labels):
+            self._cached_comp_indices[h].append(i)
+
+        self._samples_since_refit = 0
+        self._last_refit_size = N
 
     def sample(self, batch_size):
-        samp_numbers = [exp[0].item() for exp in self.buffer]
-        unique_numbers = list(set(samp_numbers))
-        samples_per_number = {key: [] for key in unique_numbers}
-        for exp in self.buffer:
-            samples_per_number[exp[0].item()].append(exp)
+        N = self._size
 
-        gmm = GaussianMixture(n_components=len(unique_numbers), random_state=42)
-        samp_numbers_array = np.array(samp_numbers).reshape(-1, 1)
-        gmm.fit(samp_numbers_array)
+        if self._need_refit() or self._cached_labels is None or len(self._cached_labels) != N:
+            self._refit_gmm()
+        self._samples_since_refit += 1
 
-        densities = gmm.predict_proba(samp_numbers_array)
-        sampling_ratios = densities.mean(axis=0)
-        sampling_ratios /= sampling_ratios.sum()
+        n_comp = self._cached_n_comp
+        comp_indices = self._cached_comp_indices
 
-        sampled_experiences = []
-        group_sample_counts = [int(batch_size * ratio) for ratio in sampling_ratios]
-        group_sample_counts[-1] += batch_size - sum(group_sample_counts)
+        ratios = np.array([len(comp_indices.get(h, [])) for h in range(n_comp)], dtype=np.float64)
+        ratios /= ratios.sum() + 1e-8
 
-        for group_idx, (number, samples) in enumerate(samples_per_number.items()):
-            group_sample_count = group_sample_counts[group_idx]
-            samples = [
-                [torch.tensor(item, dtype=torch.float32).to(device) if not isinstance(item, torch.Tensor) else item.to(device)
-                 for item in exp]
-                for exp in samples
-            ]
-            indices = torch.randperm(len(samples))[:min(group_sample_count, len(samples))]
-            sampled_experiences.extend([samples[i] for i in indices])
+        counts = [int(batch_size * r) for r in ratios]
+        counts[-1] += batch_size - sum(counts)
 
-        if len(sampled_experiences) < batch_size:
-            samples_fill = batch_size - len(sampled_experiences)
-            indices_fill = torch.randperm(len(self.buffer))[:samples_fill]
-            sampled_experiences.extend([self.buffer[i] for i in indices_fill])
+        sampled_idx = []
+        for h in range(n_comp):
+            group = comp_indices.get(h, [])
+            if not group:
+                continue
+            c = min(counts[h], len(group))
+            chosen = np.random.choice(group, size=c, replace=(c > len(group)))
+            sampled_idx.extend(chosen.tolist())
 
-        sampled_indices = torch.randperm(len(sampled_experiences))[:batch_size]
-        sampled_experiences = [sampled_experiences[i] for i in sampled_indices]
+        if len(sampled_idx) < batch_size:
+            extra = np.random.choice(N, size=batch_size - len(sampled_idx), replace=True)
+            sampled_idx.extend(extra.tolist())
 
-        unpacked = list(zip(*sampled_experiences))
-        samp_number = torch.stack(unpacked[0]).long().detach().to(device)
-        x_tensor = torch.stack(unpacked[1]).float().detach().to(device)
-        y_tensor = torch.stack(unpacked[2]).float().detach().to(device)
-        d_tensor = torch.stack(unpacked[3]).float().detach().to(device)
-        UAV_obs = torch.stack(unpacked[4]).float().detach().to(device)
-        maintenance_action = torch.stack(unpacked[5]).float().detach().to(device)
-        routing_action = torch.stack(unpacked[6]).long().detach().to(device)
-        reward = torch.tensor(unpacked[7]).float().detach().to(device)
-        next_UAV_obs = torch.stack(unpacked[8]).float().to(device)
-        done = torch.tensor(unpacked[9]).float().detach().to(device)
-        selected_UAV = torch.stack(unpacked[10]).long().detach().to(device)
+        np.random.shuffle(sampled_idx)
+        sampled_idx = sampled_idx[:batch_size]
 
-        return (
-            samp_number,
-            x_tensor,
-            y_tensor,
-            d_tensor,
-            UAV_obs,
-            maintenance_action,
-            routing_action,
-            reward,
-            next_UAV_obs,
-            done,
-            selected_UAV
-        )
+        indices = torch.tensor(sampled_idx, dtype=torch.long)
+
+        samp_number = self._fields[0][indices].long().to(device)
+        x_tensor = self._fields[1][indices].float().to(device)
+        y_tensor = self._fields[2][indices].float().to(device)
+        d_tensor = self._fields[3][indices].float().to(device)
+        UAV_obs = self._fields[4][indices].float().to(device)
+        maintenance_action = self._fields[5][indices].float().to(device)
+        routing_action = self._fields[6][indices].long().to(device)
+        reward = self._fields[7][indices].float().to(device)
+        next_UAV_obs = self._fields[8][indices].float().to(device)
+        done = self._fields[9][indices].float().to(device)
+        selected_UAV = self._fields[10][indices].long().to(device)
+
+        return (samp_number, x_tensor, y_tensor, d_tensor, UAV_obs,
+                maintenance_action, routing_action, reward, next_UAV_obs,
+                done, selected_UAV)
 
     def size(self):
-        return len(self.buffer)
+        return self._size
 
 
 # ==========================
@@ -273,14 +356,24 @@ class MADDPG:
 
         self.replay_buffer = ReplayBuffer(buffer_capacity)
 
-    def select_action(self, UAV_obs_tensor_i, selected_UAV):
+    def select_action(self, UAV_obs_tensor_i, selected_UAV, epsilon=0.0):
         UAV_obs_tensor_i = UAV_obs_tensor_i.to(device)
 
         maintenance_action, routing_probs = self.actor(UAV_obs_tensor_i, selected_UAV)
-        routing_action = torch.argmax(routing_probs, dim=-1).unsqueeze(0).to(device)
 
-        UAV = torch.tensor(self.env.UAV_obs_matrix, dtype=torch.float32).to(device)
-        broken = UAV[selected_UAV][6].to(device)
+        if epsilon > 0 and np.random.rand() < epsilon:
+            mask = (routing_probs > 0).float()
+            valid_count = mask.sum()
+            if valid_count > 0:
+                uniform = mask / valid_count
+                routing_action = torch.multinomial(uniform, 1).squeeze(-1).to(device)
+            else:
+                routing_action = torch.argmax(routing_probs, dim=-1).to(device)
+        else:
+            routing_action = torch.argmax(routing_probs, dim=-1).to(device)
+        routing_action = routing_action.unsqueeze(0)
+
+        broken = float(self.env.UAV_obs_matrix[selected_UAV, 6])
         routing_action_value = routing_action.item()
 
         if broken == 1:
@@ -292,57 +385,15 @@ class MADDPG:
 
         return maintenance_action, routing_action
 
+    def refresh_env_cache(self):
+        self.actor._cache_env_tensors()
+        self.target_actor._cache_env_tensors()
+
     def update(self, samp_number_tensor, x_tensor, y_tensor, d_tensor, UAV_obs, maintenance_action, routing_action, rewards, next_UAV_obs, done, selected_UAV):
-        transition_dict = {
-            'samp_number_tensor': samp_number_tensor,
-            'x_tensor': x_tensor,
-            'y_tensor': y_tensor,
-            'd_tensor': d_tensor,
-            'UAV_obs': UAV_obs,
-            'maintenance_action': maintenance_action,
-            'routing_action': routing_action,
-            'rewards': rewards,
-            'next_UAV_obs': next_UAV_obs,
-            'done': done,
-            'selected_UAV': selected_UAV
-        }
+        routing_action_f = routing_action.float()
+        selected_UAV_f = selected_UAV.float()
 
-        samp_number_tensor = transition_dict['samp_number_tensor'].clone().detach().to(device).float()
-
-        UAV_obs = transition_dict['UAV_obs']
-        if isinstance(UAV_obs, torch.Tensor):
-            UAV_obs = UAV_obs.clone().detach().to(device)
-        else:
-            UAV_obs = torch.tensor(UAV_obs, dtype=torch.float32).to(device)
-
-        maintenance_action = transition_dict['maintenance_action'].clone().detach().to(device).float()
-        routing_action = transition_dict['routing_action'].clone().detach().to(device).float()
-
-        rewards = transition_dict['rewards']
-        if isinstance(rewards, torch.Tensor):
-            rewards = rewards.clone().detach().to(device)
-        else:
-            rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
-
-        next_UAV_obs = transition_dict['next_UAV_obs']
-        if isinstance(next_UAV_obs, torch.Tensor):
-            next_UAV_obs = next_UAV_obs.clone().detach().to(device)
-        else:
-            next_UAV_obs = torch.tensor(next_UAV_obs, dtype=torch.float32).to(device)
-
-        done = transition_dict['done']
-        if isinstance(done, torch.Tensor):
-            done = done.clone().detach().to(device)
-        else:
-            done = torch.tensor(done, dtype=torch.float32).to(device)
-
-        selected_UAV = transition_dict['selected_UAV']
-        if isinstance(selected_UAV, torch.Tensor):
-            selected_UAV = selected_UAV.clone().detach().to(device)
-        else:
-            selected_UAV = torch.tensor(selected_UAV, dtype=torch.float32).unsqueeze(0).to(device)
-
-        q_value = self.critic(UAV_obs, maintenance_action, routing_action, selected_UAV).to(device)
+        q_value = self.critic(UAV_obs, maintenance_action, routing_action_f, selected_UAV_f)
 
         with torch.no_grad():
             broken_check = next_UAV_obs[:, :, 6]
@@ -351,34 +402,33 @@ class MADDPG:
             if has_1.any():
                 broken_indices = torch.argmax(has_1.int(), dim=1)
             else:
-                broken_indices = torch.full((next_UAV_obs.size(0),), -1, dtype=torch.long, device=next_UAV_obs.device)
+                broken_indices = torch.full((next_UAV_obs.size(0),), -1, dtype=torch.long, device=device)
 
             decision_time_check = next_UAV_obs[:, :, 7]
             min_indices = torch.argmin(decision_time_check, dim=1)
             next_selected_UAV = torch.where(has_1.any(dim=1), broken_indices, min_indices)
-            next_selected_UAV = next_selected_UAV.unsqueeze(1)
-            next_selected_UAV = next_selected_UAV.to(device)
+            next_selected_UAV = next_selected_UAV.view(-1, 1)
+            batch_sz = next_UAV_obs.size(0)
+            next_UAV_obs_next_i = next_UAV_obs[torch.arange(batch_sz, device=device), next_selected_UAV.squeeze(-1), :]
 
-            next_UAV_obs_next_i = next_UAV_obs[torch.arange(self.batch_size), next_selected_UAV.squeeze(), :].to(device)
+            next_maintenance_action, next_routing_probs = self.target_actor(next_UAV_obs_next_i, next_selected_UAV)
+            next_routing_action = torch.argmax(next_routing_probs, dim=-1).unsqueeze(1)
 
-            next_maintenance_action, next_routing_probs = self.actor(next_UAV_obs_next_i, next_selected_UAV)
-            next_routing_action = torch.argmax(next_routing_probs, dim=-1).unsqueeze(1).to(device)
+            next_q_value = self.target_critic(next_UAV_obs, next_maintenance_action,
+                                              next_routing_action.float(), next_selected_UAV.float())
 
-            next_q_value = self.critic(next_UAV_obs, next_maintenance_action,
-                                       next_routing_action, next_selected_UAV).to(device)
-
-            rewards = rewards.view(-1, 1).to(device)
-            done = done.view(-1, 1).to(device)
-            target_q_value = (rewards + self.gamma * (1 - done) * next_q_value).to(device)
+            target_q_value = rewards.view(-1, 1) + self.gamma * (1 - done.view(-1, 1)) * next_q_value
 
         critic_loss = nn.MSELoss()(q_value, target_q_value)
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        maintenance_action, routing_probs = self.actor(UAV_obs[torch.arange(self.batch_size), selected_UAV.long().squeeze(), :], selected_UAV)
-        routing_action = torch.argmax(routing_probs, dim=-1).unsqueeze(1).to(device)
-        actor_loss = -self.critic(UAV_obs, maintenance_action, routing_action, selected_UAV).mean()
+        batch_sz = UAV_obs.size(0)
+        sel = selected_UAV.long().view(-1)
+        maintenance_action_a, routing_probs = self.actor(UAV_obs[torch.arange(batch_sz, device=device), sel, :], selected_UAV_f)
+        routing_action_a = torch.argmax(routing_probs, dim=-1).unsqueeze(1).float()
+        actor_loss = -self.critic(UAV_obs, maintenance_action_a, routing_action_a, selected_UAV_f).mean()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
@@ -561,22 +611,111 @@ def apply_assignment_to_env(env, assignment):
     """
     将分配矩阵写入环境的 customer_state_space。
     assignment: (num_UAVs, num_customers)，(i,j)=1 表示客户 j 分配给 UAV i。
-    保留 env 中后半列 -2 的约定（动态客户槽）。
+    GA 负责全部客户分配，不保留动态槽位。
     """
     n_u, n_c = env.num_UAVs, env.num_customers
     env.customer_state_space = np.zeros((n_u, n_c), dtype=np.int32)
-    half = n_c // 2
     for i in range(n_u):
-        for j in range(half):
+        for j in range(n_c):
             if j < assignment.shape[1] and assignment[i, j] == 1:
                 env.customer_state_space[i, j] = 1
-    env.customer_state_space[:, half:] = -2
     env._refresh_UAV_obs()
+
+
+def save_maddpg_weights(maddpg_agent, save_dir, obs_dim, num_customers, num_UAVs):
+    """训练结束后保存 MADDPG 网络参数，供 PPO+MADDPG 加载复用。"""
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, "maddpg_pretrained.pt")
+    torch.save({
+        'actor_state_dict': maddpg_agent.actor.state_dict(),
+        'critic_state_dict': maddpg_agent.critic.state_dict(),
+        'target_actor_state_dict': maddpg_agent.target_actor.state_dict(),
+        'target_critic_state_dict': maddpg_agent.target_critic.state_dict(),
+        'obs_dim': obs_dim,
+        'num_customers': num_customers,
+        'num_UAVs': num_UAVs,
+        'maintenance_action_dim': maddpg_agent.maintenance_action_dim,
+        'routing_action_dim': maddpg_agent.routing_action_dim,
+        'gamma': maddpg_agent.gamma,
+        'tau': maddpg_agent.tau,
+    }, save_path)
+    print(f"[MADDPG] 网络参数已保存至: {os.path.abspath(save_path)}")
+    return save_path
+
+
+def log_ga_assignment_for_ppo(seed_round, assignment, env, log_path):
+    """
+    将 GA 分配结果以 PPO 可读的 JSON 格式追加写入文件。
+    每行一个 JSON 对象，PPO 预训练时可逐行读取，用作监督信号。
+    格式：{seed_round, num_UAVs, num_customers, customer_positions, customer_demands,
+           assignment_matrix, per_customer_assigned_uav}
+    其中 per_customer_assigned_uav[j] = 被分配到客户 j 的 UAV 索引（one-hot → argmax），
+    这正是 PPO CA 网络的目标输出。
+    """
+    n_u, n_c = assignment.shape
+    per_customer = {}
+    for j in range(n_c):
+        col = assignment[:, j]
+        uav_idx = int(np.argmax(col)) if col.max() > 0 else -1
+        per_customer[str(j)] = uav_idx
+
+    record = {
+        "seed_round": int(seed_round),
+        "num_UAVs": int(n_u),
+        "num_customers": int(n_c),
+        "customer_positions": env.customer_positions.tolist(),
+        "customer_demands": env.customer_cargo_demands.tolist(),
+        "assignment_matrix": assignment.tolist(),
+        "per_customer_assigned_uav": per_customer,
+    }
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def log_converged_result(seed_round, episode, UAV_routes, UAV_maintenance_actions,
+                         env, episode_cost, log_path):
+    """
+    在某轮客户点收敛后，将最终路径规划结果和维修策略写入 txt。
+    包含：客户信息、每架 UAV 的完整路径节点序列、每步对应的维修动作值。
+    """
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"第 {seed_round + 1} 轮客户点 收敛路径规划结果 (Episode {episode})\n")
+        f.write(f"{'='*60}\n")
+        f.write(f"总成本: {episode_cost:.4f}\n\n")
+
+        f.write("客户点信息:\n")
+        for j in range(env.num_customers):
+            pos = env.customer_positions[j]
+            demand = env.customer_cargo_demands[j]
+            f.write(f"  客户{j}: 位置=({pos[0]:.2f}, {pos[1]:.2f}), 需求={demand:.2f}\n")
+        f.write("\n")
+
+        f.write("各 UAV 路径规划与维修策略:\n")
+        for i in range(env.num_UAVs):
+            route = UAV_routes[i]
+            maint = UAV_maintenance_actions[i]
+            route_str = " -> ".join(str(n) for n in route) if route else "(无动作)"
+            f.write(f"  UAV{i} 路径: 仓库(0) -> {route_str} -> 仓库(0)\n")
+
+            if maint:
+                f.write(f"  UAV{i} 维修策略 (每步 maintenance_action 值):\n")
+                for step_idx, (node, m_val) in enumerate(zip(route, maint)):
+                    if m_val == 1.0:
+                        strategy_desc = "不维修(直接飞行)"
+                    elif m_val == 0.0:
+                        strategy_desc = "完全维修(役龄归零)"
+                    else:
+                        strategy_desc = f"部分维修(维修程度={1-m_val:.2f})"
+                    f.write(f"    步骤{step_idx}: 目标节点={node}, maintenance={m_val:.4f}, {strategy_desc}\n")
+            f.write("\n")
 
 
 if __name__ == "__main__":
     print("[MADDPG] 创建环境 (quiet=True，不弹窗不刷屏)...")
     _default_env = Environment(num_UAVs=3, num_customers=10, quiet=True)
+    _default_env.config['dynamic_customer_prob'] = 0.0
+    _default_env.config['dynamic_max_new_per_step'] = 0
     env = _default_env
     print(f"[MADDPG] Using device: {device}")
 
@@ -586,69 +725,98 @@ if __name__ == "__main__":
     maintenance_action_dim = 1
     routing_action_dim = 1
 
-    maddpg = MADDPG(obs_dim, maintenance_action_dim, routing_action_dim, num_customers, num_UAVs, env=env)
-    replay_buffer = ReplayBuffer(capacity=5000)
+    maddpg = MADDPG(obs_dim, maintenance_action_dim, routing_action_dim, num_customers, num_UAVs, env=env,
+                    buffer_capacity=20000, batch_size=1024)
+    replay_buffer = ReplayBuffer(capacity=20000)
 
-    update_interval = 50
+    update_interval = 20
     step_counter = 0
     max_episodes = 10000
-    samp_number = 1
+
+    # 客户点轮换：收敛后换新客户点再训，共进行 num_seed_rounds 轮（每轮训到收敛再换）
+    num_seed_rounds = 30
+    seed_round = 0
+    samp_number = seed_round + 1
+
+    # epsilon-greedy 探索
+    epsilon_start = 0.3
+    epsilon_end = 0.05
+    epsilon_decay_episodes = 2000
+    epsilon_round_start = epsilon_start
+    epsilon = epsilon_start
 
     # 收敛与训练结束
-    convergence_window = 10
-    convergence_threshold = 0.001
+    convergence_window = 50
+    convergence_threshold_cv = 0.1
+    min_episodes_before_convergence = 300
     convergence_early_stop = True
     recent_costs = []
 
-    # 客户点轮换：收敛后换新客户点再训，共进行 num_seed_rounds 轮（每轮训到收敛再换）
-    num_seed_rounds = 3
-    seed_round = 0
-
     # TensorBoard 与日志路径
-    result_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result")
+    result_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maddpgResult")
     os.makedirs(result_dir, exist_ok=True)
-    log_dir = os.path.join(result_dir, "maddpg_standalone")
+    print(f"[MADDPG] 结果输出目录: {os.path.abspath(result_dir)}")
+    log_dir = os.path.join(result_dir, "tensorboard")
     writer = SummaryWriter(log_dir=log_dir)
     assignment_log_path = os.path.join(result_dir, "maddpg_assignment.txt")
     uav_routes_log_path = os.path.join(result_dir, "maddpg_uav_routes.txt")
     broken_episodes_log_path = os.path.join(result_dir, "maddpg_broken_episodes.txt")
+    ga_ppo_log_path = os.path.join(result_dir, "ga_assignment_for_ppo.jsonl")
+    converged_routes_log_path = os.path.join(result_dir, "maddpg_converged_routes.txt")
     if os.path.exists(assignment_log_path):
         open(assignment_log_path, "w", encoding="utf-8").close()
     with open(uav_routes_log_path, "w", encoding="utf-8") as f:
-        f.write("")  # 每 episode 追加各 UAV 路径
+        f.write("")
     with open(broken_episodes_log_path, "w", encoding="utf-8") as f:
-        f.write("")  # 训练结束后写入出现损坏的 episode 及详情
+        f.write("")
+    with open(ga_ppo_log_path, "w", encoding="utf-8") as f:
+        f.write("")
+    with open(converged_routes_log_path, "w", encoding="utf-8") as f:
+        f.write("MADDPG 各轮客户点收敛后最终路径规划与维修策略\n")
 
     train_start_time = time.time()
-    print(f"[MADDPG] 开始训练，max_episodes={max_episodes}，收敛窗口={convergence_window}，阈值={convergence_threshold}，客户点轮换轮数={num_seed_rounds}")
+    print(f"[MADDPG] 开始训练，max_episodes={max_episodes}，batch_size={maddpg.batch_size}，update_interval={update_interval}，客户点轮换轮数={num_seed_rounds}")
+
+    def _run_ga_and_apply():
+        assignment, flight_cost = get_ga_assignment(env, random_state=42)
+        print(f"\n[GA] 第 {seed_round + 1} 轮客户点 - 任务分配结果 (飞行成本={flight_cost:.2f}):")
+        for i in range(num_UAVs):
+            assigned = np.where(assignment[i, :] == 1)[0].tolist()
+            load = sum(env.customer_cargo_demands[j] for j in assigned)
+            print(f"  UAV{i}: 客户 {assigned}, 载重 {load:.2f} / {env.max_UAVs_load}")
+        print("分配矩阵:\n", assignment)
+        return assignment, flight_cost
+
+    env.reset()
+    assignment, flight_cost = _run_ga_and_apply()
+    apply_assignment_to_env(env, assignment)
+    log_assignment(seed_round, assignment, flight_cost, env, assignment_log_path)
+    log_ga_assignment_for_ppo(seed_round, assignment, env, ga_ppo_log_path)
+    writer.add_scalar("ga/flight_cost", flight_cost, seed_round)
+    round_start_episode = 0
+    last_converged_routes = None
+    last_converged_maintenance = None
 
     for episode in range(max_episodes):
         env.current_episode = episode
         env.current_step = 0
-        if episode == 0 and seed_round == 0:
-            print("[MADDPG] Episode 0: 调用 env.reset()...")
         UAV_obs = env.reset()
-        if episode == 0 and seed_round == 0:
-            print("[MADDPG] reset() 完成，运行 GA 带容量路径规划...")
-        # 遗传算法：带容量约束路径规划，解码为「客户×无人机」分配矩阵，供 MADDPG 训练
-        assignment, flight_cost = get_ga_assignment(env, random_state=42)
-        if episode == 0:
-            print("[MADDPG] GA 完成，分配矩阵形状:", assignment.shape, "每列和(应全为1):", assignment.sum(axis=0)[: num_customers // 2])
         apply_assignment_to_env(env, assignment)
         UAV_obs = [env.UAV_obs_matrix[i].copy() for i in range(num_UAVs)]
-        if episode == 0:
-            print("[MADDPG] 已写入 env.customer_state_space，前半列 1 的个数:", (env.customer_state_space[:, : num_customers // 2] == 1).sum())
-
-        log_assignment(episode, assignment, flight_cost, env, assignment_log_path)
-        writer.add_scalar("ga/flight_cost", flight_cost, episode)
 
         episode_reward = 0.0
         episode_cost = 0.0
         episode_critic_loss = 0.0
         episode_actor_loss = 0.0
         episode_steps = 0
-        UAV_routes = [[] for _ in range(num_UAVs)]  # 本 episode 每架无人机的路径（依次访问的节点，0=仓库）
+        UAV_routes = [[] for _ in range(num_UAVs)]
+        UAV_maintenance_actions = [[] for _ in range(num_UAVs)]
         done = False
+
+        ep_x_tensor = torch.tensor(env.customer_positions[:, 0], dtype=torch.float32, device=device)
+        ep_y_tensor = torch.tensor(env.customer_positions[:, 1], dtype=torch.float32, device=device)
+        ep_d_tensor = torch.tensor(env.customer_cargo_demands, dtype=torch.float32, device=device)
+        ep_samp_tensor = torch.tensor(samp_number, dtype=torch.float32, device=device).unsqueeze(0)
 
         while not done:
             selected_UAV = env.selected_UAV()
@@ -658,23 +826,22 @@ if __name__ == "__main__":
                 if episode < 3:
                     print(f"[MADDPG] Episode {episode} 无有效 UAV (selected_UAV=-1)，结束本 episode，步数={episode_steps}")
                 break
-            selected_UAV_tensor = torch.tensor(selected_UAV, dtype=torch.float32).unsqueeze(0).to(device)
-            samp_number_tensor = torch.tensor(samp_number, dtype=torch.float32).unsqueeze(0).to(device)
+            selected_UAV_tensor = torch.tensor(selected_UAV, dtype=torch.float32, device=device).unsqueeze(0)
 
-            UAV_obs_array = np.array(UAV_obs)
-            UAV_obs_tensor = torch.tensor(UAV_obs_array, dtype=torch.float32).to(device)
-            UAV_obs_tensor_i = UAV_obs_tensor[selected_UAV].clone().to(device)
+            UAV_obs_tensor = torch.as_tensor(np.array(UAV_obs), dtype=torch.float32, device=device)
+            UAV_obs_tensor_i = UAV_obs_tensor[selected_UAV]
 
-            maintenance_action, routing_action = maddpg.select_action(UAV_obs_tensor_i, selected_UAV)
+            maintenance_action, routing_action = maddpg.select_action(UAV_obs_tensor_i, selected_UAV, epsilon=epsilon)
             next_UAV_obs, rewards, done, cost = env.step(maintenance_action, routing_action, selected_UAV)
 
             dest = int(routing_action.item() if hasattr(routing_action, "item") else routing_action)
             UAV_routes[selected_UAV].append(dest)
+            maint_val = float(maintenance_action.item() if hasattr(maintenance_action, "item") else maintenance_action)
+            UAV_maintenance_actions[selected_UAV].append(maint_val)
 
             episode_reward += float(rewards)
             episode_cost += float(cost.item() if hasattr(cost, "item") else cost)
 
-            # 新机替换：若本步决策的 UAV 故障，用新机替代，继承其未完成任务（-1 -> 1）
             if getattr(env.UAV_state["7_broken"], "shape", None) is not None:
                 broken_val = env.UAV_state["7_broken"][selected_UAV, 0]
             else:
@@ -683,42 +850,34 @@ if __name__ == "__main__":
                 env.replace_broken_uav_with_new(selected_UAV)
                 next_UAV_obs = [env.UAV_obs_matrix[i].copy() for i in range(num_UAVs)]
 
-            rewards_tensor = torch.tensor(rewards, dtype=torch.float32).to(device)
-            done_tensor = torch.tensor(done, dtype=torch.float32).to(device)
-            next_UAV_obs_tensor = torch.tensor(np.array(next_UAV_obs), dtype=torch.float32).to(device)
+            rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)
+            done_tensor = torch.tensor(done, dtype=torch.float32, device=device)
+            next_UAV_obs_tensor = torch.as_tensor(np.array(next_UAV_obs), dtype=torch.float32, device=device)
 
-            # buffer 仍按原接口存（含 xyd 占位，网络已不消费）
-            x_tensor = torch.zeros(num_customers, dtype=torch.float32).to(device)
-            y_tensor = torch.zeros(num_customers, dtype=torch.float32).to(device)
-            d_tensor = torch.zeros(num_customers, dtype=torch.float32).to(device)
             replay_buffer.add(
-                samp_number_tensor, x_tensor, y_tensor, d_tensor,
+                ep_samp_tensor, ep_x_tensor, ep_y_tensor, ep_d_tensor,
                 UAV_obs_tensor, maintenance_action, routing_action,
                 rewards_tensor, next_UAV_obs_tensor, done_tensor, selected_UAV_tensor,
             )
 
             if step_counter % update_interval == 0 and replay_buffer.size() >= maddpg.batch_size:
-                batch = replay_buffer.sample(maddpg.batch_size)
-                transition_dict = {
-                    "samp_number_tensor": batch[0].to(device),
-                    "x_tensor": batch[1].to(device),
-                    "y_tensor": batch[2].to(device),
-                    "d_tensor": batch[3].to(device),
-                    "UAV_obs": batch[4].to(device),
-                    "maintenance_action": batch[5].to(device),
-                    "routing_action": batch[6].to(device),
-                    "rewards": batch[7].to(device),
-                    "next_UAV_obs": batch[8].to(device),
-                    "done": batch[9].to(device),
-                    "selected_UAV": batch[10].to(device),
-                }
-                c_loss, a_loss = maddpg.update(**transition_dict)
-                episode_critic_loss += c_loss
-                episode_actor_loss += a_loss
+                num_updates = 3
+                for _ in range(num_updates):
+                    batch = replay_buffer.sample(maddpg.batch_size)
+                    c_loss, a_loss = maddpg.update(
+                        samp_number_tensor=batch[0], x_tensor=batch[1],
+                        y_tensor=batch[2], d_tensor=batch[3],
+                        UAV_obs=batch[4], maintenance_action=batch[5],
+                        routing_action=batch[6], rewards=batch[7],
+                        next_UAV_obs=batch[8], done=batch[9],
+                        selected_UAV=batch[10],
+                    )
+                    episode_critic_loss += c_loss
+                    episode_actor_loss += a_loss
                 writer.add_scalar("maddpg/critic_loss_step", c_loss, step_counter)
                 writer.add_scalar("maddpg/actor_loss_step", a_loss, step_counter)
                 if episode < 2 and episode_steps <= update_interval * 2:
-                    print(f"[MADDPG] 更新 step={step_counter} critic_loss={c_loss:.4f} actor_loss={a_loss:.4f}")
+                    print(f"[MADDPG] 更新 step={step_counter} x{num_updates} critic_loss={c_loss:.4f} actor_loss={a_loss:.4f}")
 
             UAV_obs = next_UAV_obs
             step_counter += 1
@@ -729,42 +888,81 @@ if __name__ == "__main__":
         # Episode 级 TensorBoard
         writer.add_scalar("episode/total_reward", episode_reward, episode)
         writer.add_scalar("episode/total_cost", episode_cost, episode)
-        writer.add_scalar("episode/critic_loss_sum", episode_critic_loss, episode)
-        writer.add_scalar("episode/actor_loss_sum", episode_actor_loss, episode)
+        if episode_critic_loss != 0.0 or episode_actor_loss != 0.0:
+            writer.add_scalar("episode/critic_loss_sum", episode_critic_loss, episode)
+            writer.add_scalar("episode/actor_loss_sum", episode_actor_loss, episode)
         writer.add_scalar("episode/buffer_size", replay_buffer.size(), episode)
         writer.add_scalar("episode/steps", episode_steps, episode)
 
+        # epsilon 衰减（按轮内 episode 计算，换客户点后自动重新衰减）
+        round_ep = episode - round_start_episode
+        epsilon = max(epsilon_end, epsilon_round_start - (epsilon_round_start - epsilon_end) * round_ep / epsilon_decay_episodes)
+        writer.add_scalar("episode/epsilon", epsilon, episode)
+
         if episode % 10 == 0 or episode < 3:
-            print(f"[MADDPG] Episode {episode} done, steps={episode_steps}, reward={episode_reward:.2f}, cost={episode_cost:.4f}, buffer={replay_buffer.size()}")
+            print(f"[MADDPG] Episode {episode} done, steps={episode_steps}, reward={episode_reward:.2f}, cost={episode_cost:.4f}, eps={epsilon:.3f}, buffer={replay_buffer.size()}")
         writer.flush()
 
-        # 本 episode 各无人机路径规划结果写入 txt
+        # 本 episode 各无人机路径规划与维修策略写入 txt
         with open(uav_routes_log_path, "a", encoding="utf-8") as f:
             f.write(f"\n=== Episode {episode} 各无人机路径（节点序列，0=仓库 1~n=客户） ===\n")
             for i in range(num_UAVs):
                 f.write(f"  UAV{i}: {' -> '.join(map(str, UAV_routes[i]))}\n")
+                if UAV_maintenance_actions[i]:
+                    maint_str = ", ".join(f"{v:.2f}" for v in UAV_maintenance_actions[i])
+                    f.write(f"    维修动作: [{maint_str}]\n")
 
-        # 收敛判断
+        last_converged_routes = UAV_routes
+        last_converged_maintenance = UAV_maintenance_actions
+        last_converged_cost = episode_cost
+
+        # 收敛判断：使用变异系数 (std/mean)，窗口 50，且需至少训练 min_episodes_before_convergence
         _cost = float(episode_cost)
         recent_costs.append(_cost)
         if len(recent_costs) > convergence_window:
             recent_costs.pop(0)
-        if len(recent_costs) >= convergence_window and (max(recent_costs) - min(recent_costs) <= convergence_threshold):
-            print(f"第 {seed_round + 1} 轮客户点：第 {episode} 次 episode 收敛（最近 {convergence_window} 轮 cost 波动 <= {convergence_threshold}）。")
-            with open(assignment_log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n第 {seed_round + 1} 轮客户点收敛于 episode {episode}。\n")
+
+        round_episode_count = episode - round_start_episode
+        converged = False
+        if round_episode_count >= min_episodes_before_convergence and len(recent_costs) >= convergence_window:
+            mean_cost = np.mean(recent_costs)
+            std_cost = np.std(recent_costs)
+            cv = std_cost / (mean_cost + 1e-8)
+            if cv <= convergence_threshold_cv:
+                converged = True
+                print(f"第 {seed_round + 1} 轮客户点：第 {episode} 次 episode 收敛（本轮已训 {round_episode_count} ep，最近 {convergence_window} 轮 CV={cv:.4f} <= {convergence_threshold_cv}，mean_cost={mean_cost:.4f}）。")
+                with open(assignment_log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n第 {seed_round + 1} 轮客户点收敛于 episode {episode}（CV={cv:.4f}, mean_cost={mean_cost:.4f}）。\n")
+
+        if converged:
+            log_converged_result(seed_round, episode, last_converged_routes,
+                                 last_converged_maintenance, env,
+                                 last_converged_cost, converged_routes_log_path)
             if seed_round >= num_seed_rounds - 1:
                 if convergence_early_stop:
                     print(f"已完成 {num_seed_rounds} 轮客户点训练，结束训练。")
                 break
             env.update_seed()
-            recent_costs = []
             seed_round += 1
-            print(f"[MADDPG] 第 {seed_round + 1}/{num_seed_rounds} 轮客户点，继续训练...")
+            samp_number = seed_round + 1
+            env.reset()
+            maddpg.refresh_env_cache()
+            assignment, flight_cost = _run_ga_and_apply()
+            apply_assignment_to_env(env, assignment)
+            log_assignment(seed_round, assignment, flight_cost, env, assignment_log_path)
+            log_ga_assignment_for_ppo(seed_round, assignment, env, ga_ppo_log_path)
+            writer.add_scalar("ga/flight_cost", flight_cost, seed_round)
+            recent_costs = []
+            round_start_episode = episode + 1
+            epsilon_round_start = epsilon_start * 0.5
+            epsilon = epsilon_round_start
+            print(f"[MADDPG] 第 {seed_round + 1}/{num_seed_rounds} 轮客户点，epsilon 重置为 {epsilon_round_start:.2f}，继续训练...")
         if (episode + 1) >= max_episodes:
             print(f"已达到最大训练轮数 {max_episodes}，结束训练。")
 
-    # 训练结束：总时长、损坏 episode 记录
+    # 训练结束：保存网络参数、总时长、损坏 episode 记录
+    save_maddpg_weights(maddpg, result_dir, obs_dim, num_customers, num_UAVs)
+
     train_end_time = time.time()
     total_train_seconds = train_end_time - train_start_time
     print(f"总训练时长: {total_train_seconds:.2f} 秒")
