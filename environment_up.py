@@ -70,12 +70,10 @@ class Environment(gym.Env):
             "8_decision_time": spaces.Box(low=0.0, high=24.0, shape=(num_UAVs,1), dtype=np.float32)
         })
 
-        # 定义状态空间Cus
-        """给定版本
-        self.customer_state_space = np.array([[1, 1, 1, 0, 0, 0],
-                                      [0, 0, 0, 1, 1, 1]])
-        """
-        self.customer_state_space = spaces.Box(low=-1,high=2,shape=(num_UAVs,num_customers),dtype=np.int32)
+        # 定义状态空间Cus（行=UAV, 列=客户）
+        # 状态语义: 0=未分配, 1=已分配待执行, 2=已完成, -1=故障需重分配, -2=动态新客户需分配
+        # 流程: 初始全0 -> PPO分配后每列和为1 -> MADDPG完成则1变2 -> 故障则该行1变-1(2不变)
+        self.customer_state_space = spaces.Box(low=-2, high=2, shape=(num_UAVs, num_customers), dtype=np.int32)
         #self.customer_state_space = self.new_customer_state_space()
 
         # 定义动作空间UAV
@@ -155,11 +153,12 @@ class Environment(gym.Env):
         if prob <= 0.0 or max_new <= 0:
             return
 
-        # 候选槽：所有 UAV 行在该列上的值都属于 {2, -1}，表示旧任务已完成/失效
+        # 候选槽：仅当该列全为 2（已完成）时才可生成新客户。
+        # -1 表示故障需重分配，不能当作“空闲槽”生成新客户。
         candidates = []
         for j in range(self.num_customers):
             col = self.customer_state_space[:, j]
-            if np.all(np.isin(col, [2, -1])):
+            if np.all(col == 2):
                 candidates.append(j)
 
         if not candidates:
@@ -176,8 +175,8 @@ class Environment(gym.Env):
                 d = self._sample_single_customer_demand()
                 self.customer_positions[j] = np.array([x, y])
                 self.customer_cargo_demands[j] = d
-                # 重置该槽的客户状态为 0（未分配、尚未出现的客户，将在 CA 阶段被逐步分配）
-                self.customer_state_space[:, j] = 0
+                # 用 -2 标记动态新客户，与初始未分配(0)、故障重分配(-1) 区分
+                self.customer_state_space[:, j] = -2
                 # 记录动态新客户事件
                 self.dynamic_customer_events.append({
                     "episode": int(self.current_episode),
@@ -298,10 +297,8 @@ class Environment(gym.Env):
             "8_decision_time": np.zeros((self.num_UAVs, 1), dtype=np.float32)  # 决策时间为0
         }
 
-        # 客户状态重置
-        #self.customer_state_space = self.new_customer_state_space()
-        self.customer_state_space = np.zeros((self.num_UAVs, self.num_customers))  # 0表示无人机客户暂未匹配
-        self.customer_state_space[:, self.num_customers // 2:] = -2  # 前半部分是已知客户，后半部分是随机客户标记为-2
+        # 客户状态重置：所有 num_customers 个客户在 episode 开始时全部可见（状态 0 = 未分配）
+        self.customer_state_space = np.zeros((self.num_UAVs, self.num_customers))
 
         # 决策时刻重置→编进state里面
         # self.decision_time = np.zeros((1, 1), dtype=np.float32) 
@@ -510,23 +507,19 @@ class Environment(gym.Env):
             UAV["8_decision_time"][selected_UAV] = UAV["8_decision_time"][selected_UAV] #故障无人机不更新决策时间，表示下次决策还是它
 
                 
-        # 更新 customer_state_space （可以变成如果broken=1的那么customer特殊对待，如果是正常的话直接1变2）
+        # 更新 customer_state_space
         if routing_action.item() != 0:
             if UAV["7_broken"][selected_UAV] == 1:
                 # 遍历 selected_UAV 对应的行，将所有值为 1 的元素修改为 -1；若没1，则不变
                 self.customer_state_space[selected_UAV, :] = np.where(self.customer_state_space[selected_UAV, :] == 1, -1, self.customer_state_space[selected_UAV, :])
             else:
-                self.customer_state_space[selected_UAV, routing_action.item() - 1] = 2  # 正常服务客户点，1变2表示已服务
-
-                # 处理随机客户：查找包含 -2 的列索引，并将前两列中的 -2 全部改为 -1
-                random_customer = [j for j in range(self.customer_state_space.shape[1])
-                            if -2 in self.customer_state_space[:, j]]
-
-                # 只处理前两个有 -2 的列
-                for j in random_customer[:2]:
-                    self.customer_state_space[:, j] = np.where(
-                        self.customer_state_space[:, j] == -2, -1, self.customer_state_space[:, j]
-                    )
+                # 正常服务客户点：将该列所有行中非 -1 的条目标记为 2，表示该客户已完全服务完毕
+                col_idx = routing_action.item() - 1
+                self.customer_state_space[:, col_idx] = np.where(
+                    self.customer_state_space[:, col_idx] == -1,
+                    -1,
+                    2
+                )
 
 
         elif routing_action.item() == 0:
@@ -534,8 +527,8 @@ class Environment(gym.Env):
                 # 遍历 selected_UAV 对应的行，将所有值为 1 的元素修改为 -1；若没1，则不变
                 self.customer_state_space[selected_UAV, :] = np.where(self.customer_state_space[selected_UAV, :] == 1, -1, self.customer_state_space[selected_UAV, :])
             else:
-                self.customer_state_space[selected_UAV] = self.customer_state_space[selected_UAV] #正常回仓库不改变客户完成情况，还是这台机的任务
-            # （+上层：故障所有1的点变成0初始化）
+                # 正常回仓库不改变客户完成情况
+                self.customer_state_space[selected_UAV] = self.customer_state_space[selected_UAV]
 
         
         # 复制其他无人机的状态
@@ -624,10 +617,9 @@ class Environment(gym.Env):
         # 增加步数
         self.current_step += 1
 
-        # 检查是否达到终止条件
-        #第一个条件：检查所有无人机的状态是否都不包含 1 或 -1。第二个条件：检查 "2_destination" 的所有值是否都为 0。
-        #如果这两个条件都为 True，则 done 为 True，否则为 False。
-        done = (all(np.all(~np.isin(self.customer_state_space[i, :], [1, -1])) for i in range(self.num_UAVs)) and np.all(UAV["2_destination"] == 0))
+        # 终止条件：所有客户均已服务完毕（状态 2）且所有 UAV 已回仓库
+        # 0=未分配, 1=已分配待执行, -1=故障需重分配, -2=动态新客户需分配
+        done = (all(np.all(~np.isin(self.customer_state_space[i, :], [0, 1, -1, -2])) for i in range(self.num_UAVs)) and np.all(UAV["2_destination"] == 0))
 
         return new_UAV_obs, reward, done, cost
     
@@ -700,10 +692,9 @@ class Environment(gym.Env):
         # 增加步数
         self.current_step += 1
 
-        # 检查是否达到终止条件
-        #第一个条件：检查所有无人机的状态是否都不包含 1 或 -1。第二个条件：检查 "2_destination" 的所有值是否都为 0。
-        #如果这两个条件都为 True，则 done 为 True，否则为 False。
-        done = (all(np.all(~np.isin(self.customer_state_space[i, :], [1, -1])) for i in range(self.num_UAVs)) and np.all(UAV["2_destination"] == 0))
+        # 终止条件：所有客户均已服务完毕（状态 2）且所有 UAV 已回仓库
+        # 0=未分配, 1=已分配待执行, -1=故障需重分配, -2=动态新客户需分配
+        done = (all(np.all(~np.isin(self.customer_state_space[i, :], [0, 1, -1, -2])) for i in range(self.num_UAVs)) and np.all(UAV["2_destination"] == 0))
 
         return new_UAV_obs, reward_CA, done, cost_CA
 

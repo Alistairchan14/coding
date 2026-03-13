@@ -11,6 +11,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.mixture import GaussianMixture
 from torch.utils.tensorboard import SummaryWriter
@@ -77,7 +78,7 @@ class ActorNetwork(nn.Module):
         routing_logits = routing_logits * masks_tensor + ~masks_tensor * (-1e9)
         routing_probs = torch.softmax(routing_logits, dim=-1)
 
-        return maintenance_action, routing_probs
+        return maintenance_action, routing_probs, routing_logits
 
     def get_UAV_action_mask(self, UAV_obs_tensor_i):
         if not hasattr(self, '_c_demands') or self._env_cache_version < 0:
@@ -150,6 +151,15 @@ class CriticNetwork(nn.Module):
         x = torch.relu(self.fc2(x))
         q_value = self.out(x)
         return q_value
+
+
+def gumbel_softmax(logits, tau=0.5, dim=-1):
+    """
+    Gumbel-Softmax 采样：得到可导的软 one-hot 向量，使 Critic 的梯度能回传到 Actor 的 routing 权重。
+    """
+    gumbels = -torch.empty_like(logits).exponential_().log()
+    y = (logits + gumbels) / tau
+    return F.softmax(y, dim=dim)
 
 
 # ==========================
@@ -341,12 +351,14 @@ class MADDPG:
         self.tau = tau
 
         selected_UAV_dim = 1
+        # Critic 接收 routing 的软 one-hot（num_customers+1 维）以支持 Gumbel-Softmax 梯度回传
+        routing_action_dim_for_critic = num_customers + 1
 
         self.actor = ActorNetwork(obs_dim, num_customers, env=self.env).to(device)
-        self.critic = CriticNetwork(obs_dim, maintenance_action_dim, routing_action_dim, selected_UAV_dim, num_customers, num_UAVs).to(device)
+        self.critic = CriticNetwork(obs_dim, maintenance_action_dim, routing_action_dim_for_critic, selected_UAV_dim, num_customers, num_UAVs).to(device)
 
         self.target_actor = ActorNetwork(obs_dim, num_customers, env=self.env).to(device)
-        self.target_critic = CriticNetwork(obs_dim, maintenance_action_dim, routing_action_dim, selected_UAV_dim, num_customers, num_UAVs).to(device)
+        self.target_critic = CriticNetwork(obs_dim, maintenance_action_dim, routing_action_dim_for_critic, selected_UAV_dim, num_customers, num_UAVs).to(device)
 
         self.target_actor.load_state_dict(self.actor.state_dict())
         self.target_critic.load_state_dict(self.critic.state_dict())
@@ -359,7 +371,7 @@ class MADDPG:
     def select_action(self, UAV_obs_tensor_i, selected_UAV, epsilon=0.0):
         UAV_obs_tensor_i = UAV_obs_tensor_i.to(device)
 
-        maintenance_action, routing_probs = self.actor(UAV_obs_tensor_i, selected_UAV)
+        maintenance_action, routing_probs, _ = self.actor(UAV_obs_tensor_i, selected_UAV)
 
         if epsilon > 0 and np.random.rand() < epsilon:
             mask = (routing_probs > 0).float()
@@ -390,10 +402,11 @@ class MADDPG:
         self.target_actor._cache_env_tensors()
 
     def update(self, samp_number_tensor, x_tensor, y_tensor, d_tensor, UAV_obs, maintenance_action, routing_action, rewards, next_UAV_obs, done, selected_UAV):
-        routing_action_f = routing_action.float()
         selected_UAV_f = selected_UAV.float()
+        # 将 buffer 中存储的离散 routing 索引转为 one-hot，与 Critic 输入维度一致
+        routing_one_hot = F.one_hot(routing_action.squeeze(-1).long(), num_classes=self.num_customers + 1).float()
 
-        q_value = self.critic(UAV_obs, maintenance_action, routing_action_f, selected_UAV_f)
+        q_value = self.critic(UAV_obs, maintenance_action, routing_one_hot, selected_UAV_f)
 
         with torch.no_grad():
             broken_check = next_UAV_obs[:, :, 6]
@@ -411,11 +424,11 @@ class MADDPG:
             batch_sz = next_UAV_obs.size(0)
             next_UAV_obs_next_i = next_UAV_obs[torch.arange(batch_sz, device=device), next_selected_UAV.squeeze(-1), :]
 
-            next_maintenance_action, next_routing_probs = self.target_actor(next_UAV_obs_next_i, next_selected_UAV)
-            next_routing_action = torch.argmax(next_routing_probs, dim=-1).unsqueeze(1)
+            next_maintenance_action, next_routing_probs, _ = self.target_actor(next_UAV_obs_next_i, next_selected_UAV)
+            next_routing_one_hot = F.one_hot(torch.argmax(next_routing_probs, dim=-1), num_classes=self.num_customers + 1).float()
 
             next_q_value = self.target_critic(next_UAV_obs, next_maintenance_action,
-                                              next_routing_action.float(), next_selected_UAV.float())
+                                              next_routing_one_hot, next_selected_UAV.float())
 
             target_q_value = rewards.view(-1, 1) + self.gamma * (1 - done.view(-1, 1)) * next_q_value
 
@@ -426,9 +439,10 @@ class MADDPG:
 
         batch_sz = UAV_obs.size(0)
         sel = selected_UAV.long().view(-1)
-        maintenance_action_a, routing_probs = self.actor(UAV_obs[torch.arange(batch_sz, device=device), sel, :], selected_UAV_f)
-        routing_action_a = torch.argmax(routing_probs, dim=-1).unsqueeze(1).float()
-        actor_loss = -self.critic(UAV_obs, maintenance_action_a, routing_action_a, selected_UAV_f).mean()
+        maintenance_action_a, _, routing_logits = self.actor(UAV_obs[torch.arange(batch_sz, device=device), sel, :], selected_UAV_f)
+        # 使用 Gumbel-Softmax 得到可导的软 one-hot，梯度可回传到 Actor 的 routing 权重
+        soft_routing = gumbel_softmax(routing_logits, tau=0.5)
+        actor_loss = -self.critic(UAV_obs, maintenance_action_a, soft_routing, selected_UAV_f).mean()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()

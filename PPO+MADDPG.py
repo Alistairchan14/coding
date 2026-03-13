@@ -22,6 +22,9 @@ import maddpg as maddpg_module
 from maddpg import ReplayBuffer, get_device
 
 env = Environment(num_UAVs=3, num_customers=10, quiet=True)
+# 动态客户参数可在此覆盖环境默认值（默认 prob=0.1, max_new=2）
+# env.config['dynamic_customer_prob'] = 0.05
+# env.config['dynamic_max_new_per_step'] = 1
 maddpg_module._default_env = env
 
 device = get_device()
@@ -95,14 +98,16 @@ class RolloutBuffer:
 # ==========================
 class PPO:
     def __init__(self, UAV_input_dim, num_UAVs, num_customers,
-                 lr_actor=5e-5, lr_critic=5e-5, gamma=0.99,
-                 k_epochs=4, eps_clip=0.2, hidden_dim=128):
+                 lr_actor=2e-5, lr_critic=2e-5, gamma=0.99,
+                 k_epochs=4, eps_clip=0.15, hidden_dim=128,
+                 gae_lambda=0.95):
         self.UAV_input_dim = UAV_input_dim
         self.num_UAVs = num_UAVs
         self.num_customers = num_customers
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.k_epochs = k_epochs
+        self.gae_lambda = gae_lambda
 
         self.actor = PPOActor(UAV_input_dim, num_UAVs, hidden_dim).to(device)
         self.critic = PPOCritic(UAV_input_dim, hidden_dim).to(device)
@@ -113,38 +118,81 @@ class PPO:
         self.buffer = RolloutBuffer()
 
     def _build_state(self, x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor):
+        """全局观测: [当前客户 x,y,d | 所有UAV状态(8维×num_UAVs) | 所有UAV位置/目的地坐标 | 完整任务分配矩阵(num_UAVs×num_customers)]"""
         x_i_tensor = x_i_tensor.to(device)
         y_i_tensor = y_i_tensor.to(device)
         d_i_tensor = d_i_tensor.to(device)
         UAV_obs_tensor = UAV_obs_tensor.to(device)
 
-        task = UAV_obs_tensor[:, -self.num_customers:]
-        task_sum = task.sum(dim=0, keepdim=True)
-
-        base = torch.stack(
+        customer_info = torch.stack(
             [x_i_tensor.squeeze(), y_i_tensor.squeeze(), d_i_tensor.squeeze()],
             dim=-1
-        ).unsqueeze(0)
+        ).unsqueeze(0)  # [1, 3]
 
-        state = torch.cat([base, task_sum], dim=-1)
+        # 原始 UAV 状态与任务矩阵
+        uav_states = UAV_obs_tensor[:, :8]  # [num_UAVs, 8]
+        task_matrix = UAV_obs_tensor[:, -self.num_customers:]  # [num_UAVs, num_customers]
 
-        state_dim = state.shape[1]
-        if state_dim < self.UAV_input_dim:
-            pad = torch.zeros(1, self.UAV_input_dim - state_dim, device=device)
-            state = torch.cat([state, pad], dim=1)
-        elif state_dim > self.UAV_input_dim:
-            state = state[:, :self.UAV_input_dim]
+        # 将 UAV 的位置/目的地节点 id 映射为实际坐标 (0 = 仓库(0,0), 1..N = 客户坐标)
+        position_ids = uav_states[:, 0].long()
+        destination_ids = uav_states[:, 1].long()
 
+        num_uavs = self.num_UAVs
+        uav_pos_coords = torch.zeros((num_uavs, 2), dtype=torch.float32, device=device)
+        uav_dest_coords = torch.zeros((num_uavs, 2), dtype=torch.float32, device=device)
+
+        # 使用环境中的最新客户坐标进行映射（支持动态客户）
+        customer_positions_np = env.customer_positions  # [num_customers, 2]
+        customer_positions = torch.as_tensor(customer_positions_np, dtype=torch.float32, device=device)
+
+        pos_mask = position_ids > 0
+        if pos_mask.any():
+            uav_pos_coords[pos_mask] = customer_positions[position_ids[pos_mask] - 1]
+
+        dest_mask = destination_ids > 0
+        if dest_mask.any():
+            uav_dest_coords[dest_mask] = customer_positions[destination_ids[dest_mask] - 1]
+
+        uav_states_flat = uav_states.reshape(1, -1)                # [1, num_UAVs * 8]
+        uav_pos_coords_flat = uav_pos_coords.reshape(1, -1)        # [1, num_UAVs * 2]
+        uav_dest_coords_flat = uav_dest_coords.reshape(1, -1)      # [1, num_UAVs * 2]
+        task_matrix_flat = task_matrix.reshape(1, -1)              # [1, num_UAVs * num_customers]
+
+        state = torch.cat(
+            [customer_info, uav_states_flat, uav_pos_coords_flat, uav_dest_coords_flat, task_matrix_flat],
+            dim=-1
+        )
         return state
 
-    def select_action(self, x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor):
+    @torch.no_grad()
+    def select_action(self, x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor,
+                      deterministic=False):
+        UAV_obs_tensor = UAV_obs_tensor.to(device)
         state = self._build_state(x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor)
 
         logits = self.actor(state)
-        probs = torch.softmax(logits, dim=-1)
-        m = Categorical(probs)
-        action = m.sample()
-        log_prob = m.log_prob(action)
+
+        # 基于 broken 标志对损坏 UAV 做动作屏蔽
+        broken_flags = UAV_obs_tensor[:, 6]  # 1 = 损坏, 0 = 正常
+        broken_mask = broken_flags >= 0.5
+
+        if broken_mask.any() and not broken_mask.all():
+            masked_logits = logits.clone()
+            masked_logits[0, broken_mask] = -1e9
+        else:
+            # 若全部正常或全部损坏，则暂不强制屏蔽，保持 logits 原样
+            masked_logits = logits
+
+        probs = torch.softmax(masked_logits, dim=-1)
+
+        if deterministic:
+            action = torch.argmax(probs, dim=-1)
+            log_prob = torch.zeros_like(action, dtype=torch.float32)
+        else:
+            m = Categorical(probs)
+            action = m.sample()
+            log_prob = m.log_prob(action)
+
         value = self.critic(state).squeeze(-1)
 
         assignment_one_hot = torch.zeros_like(probs)
@@ -187,27 +235,40 @@ class PPO:
 
     def update(self):
         if len(self.buffer.rewards) == 0:
-            return
-        old_states = torch.FloatTensor(self.buffer.UAV_obs).to(device)
+            return None
+        states_np = np.array(self.buffer.UAV_obs, dtype=np.float32)
+        old_states = torch.from_numpy(states_np).to(device)
         old_actions = torch.LongTensor(self.buffer.actions).to(device)
         old_log_probs = torch.FloatTensor(self.buffer.log_probs).to(device)
         rewards = torch.FloatTensor(self.buffer.rewards).to(device)
         old_values = torch.FloatTensor(self.buffer.values).to(device)
         is_terminals = self.buffer.is_terminals
 
-        returns = []
-        discounted_sum = 0.0
-        for reward, done in zip(reversed(rewards), reversed(is_terminals)):
-            if done:
-                discounted_sum = 0.0
-            discounted_sum = reward + self.gamma * discounted_sum
-            returns.insert(0, discounted_sum)
-        returns = torch.FloatTensor(returns).to(device)
+        # GAE(λ) 优势估计
+        T = rewards.shape[0]
+        advantages = torch.zeros(T, dtype=torch.float32, device=device)
+        gae = 0.0
+        next_value = 0.0
+        for t in reversed(range(T)):
+            mask = 0.0 if is_terminals[t] else 1.0
+            delta = rewards[t] + self.gamma * next_value * mask - old_values[t]
+            gae = delta + self.gamma * self.gae_lambda * gae * mask
+            advantages[t] = gae
+            next_value = old_values[t]
 
-        advantages = returns - old_values
-        adv_std = advantages.std()
-        if adv_std > 1e-8:
-            advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
+        # 对优势函数做标准化，有助于稳定 PPO 训练
+        adv_mean = advantages.mean()
+        adv_std = advantages.std() + 1e-8
+        advantages = (advantages - adv_mean) / adv_std
+
+        returns = advantages + old_values
+
+        # 统计信息累计（按 epoch 平均）
+        total_actor_loss = 0.0
+        total_critic_loss = 0.0
+        total_kl = 0.0
+        total_entropy = 0.0
+        total_clip_frac = 0.0
 
         for _ in range(self.k_epochs):
             logits = self.actor(old_states)
@@ -218,22 +279,46 @@ class PPO:
             values = self.critic(old_states).squeeze(1)
 
             ratio = torch.exp(new_log_probs - old_log_probs)
-
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-            actor_loss = -torch.min(surr1, surr2).mean()
+
+            # PPO-Clip 基础损失 + 熵正则化（系数 0.01，熵惩罚即减去熵以鼓励探索）
+            policy_loss = -torch.min(surr1, surr2).mean()
+            entropy = dist.entropy().mean()
+            entropy_coef = 0.01
+            actor_loss = policy_loss - entropy_coef * entropy
 
             critic_loss = nn.MSELoss()(values, returns)
 
+            # 统计量
+            with torch.no_grad():
+                approx_kl = (old_log_probs - new_log_probs).mean().item()
+                clip_frac = (torch.abs(ratio - 1.0) > self.eps_clip).float().mean().item()
+                total_actor_loss += actor_loss.item()
+                total_critic_loss += critic_loss.item()
+                total_kl += approx_kl
+                total_entropy += entropy.item()
+                total_clip_frac += clip_frac
+
             self.optimizer_actor.zero_grad()
             actor_loss.backward(retain_graph=True)
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
             self.optimizer_actor.step()
 
             self.optimizer_critic.zero_grad()
             critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
             self.optimizer_critic.step()
 
         self.buffer.clear()
+        k = float(self.k_epochs)
+        return {
+            "actor_loss": total_actor_loss / k,
+            "critic_loss": total_critic_loss / k,
+            "approx_kl": total_kl / k,
+            "entropy": total_entropy / k,
+            "clip_fraction": total_clip_frac / k,
+        }
 
 
 # ==========================
@@ -257,6 +342,17 @@ def pretrain_ppo_with_ga_data(the_env, ppo, ga_data_path, num_iters=300):
         print("[PPO 预训练] GA 数据为空，跳过预训练")
         return
 
+    n_uavs = ppo.num_UAVs
+    n_cust = ppo.num_customers
+
+    initial_uav_state = torch.zeros(8, dtype=torch.float32, device=device)
+    initial_uav_state[4] = 100.0  # energy = 100
+    uav_states_flat = initial_uav_state.repeat(n_uavs).unsqueeze(0)  # [1, num_UAVs*8]
+    # 预训练阶段为 UAV 位置/目的地坐标提供占位零向量（与正式训练输入维度对齐）
+    uav_pos_coords_flat = torch.zeros(1, n_uavs * 2, dtype=torch.float32, device=device)
+    uav_dest_coords_flat = torch.zeros(1, n_uavs * 2, dtype=torch.float32, device=device)
+    task_matrix_flat = torch.zeros(1, n_uavs * n_cust, dtype=torch.float32, device=device)
+
     states_all, targets_all = [], []
     for rec in records:
         positions = np.array(rec['customer_positions'])
@@ -264,27 +360,20 @@ def pretrain_ppo_with_ga_data(the_env, ppo, ga_data_path, num_iters=300):
         assignment = rec['per_customer_assigned_uav']
         n_c = rec['num_customers']
 
-        task_sum = torch.zeros(1, n_c, device=device)
-
         for j in range(n_c):
             target_uav = assignment[str(j)]
             if target_uav < 0:
                 continue
 
-            x_j = torch.tensor(positions[j][0], dtype=torch.float32, device=device)
-            y_j = torch.tensor(positions[j][1], dtype=torch.float32, device=device)
-            d_j = torch.tensor(demands[j], dtype=torch.float32, device=device)
+            customer_info = torch.tensor(
+                [positions[j][0], positions[j][1], demands[j]],
+                dtype=torch.float32, device=device
+            ).unsqueeze(0)  # [1, 3]
 
-            base = torch.stack([x_j, y_j, d_j], dim=-1).unsqueeze(0)
-            state = torch.cat([base, task_sum], dim=-1)
-
-            state_dim = state.shape[1]
-            if state_dim < ppo.UAV_input_dim:
-                pad = torch.zeros(1, ppo.UAV_input_dim - state_dim, device=device)
-                state = torch.cat([state, pad], dim=1)
-            elif state_dim > ppo.UAV_input_dim:
-                state = state[:, :ppo.UAV_input_dim]
-
+            state = torch.cat(
+                [customer_info, uav_states_flat, uav_pos_coords_flat, uav_dest_coords_flat, task_matrix_flat],
+                dim=-1
+            )
             states_all.append(state.squeeze(0))
             targets_all.append(target_uav)
 
@@ -352,8 +441,10 @@ if os.path.exists(ckpt_path):
 else:
     print(f"[MADDPG] 预训练权重未找到 ({ckpt_path})，使用随机初始化")
 
-# PPO
-ppo = PPO(UAV_input_dim=8 + num_customers, num_UAVs=num_UAVs, num_customers=num_customers)
+# PPO（全局观测维度: 3 + num_UAVs*(8 + 2 + 2) + num_UAVs*num_customers）
+# 8 = 原始 UAV 状态维度；2+2 = 当前位置(x,y)与目的地(x,y)坐标
+ppo_state_dim = 3 + num_UAVs * (8 + 2 + 2) + num_UAVs * num_customers
+ppo = PPO(UAV_input_dim=ppo_state_dim, num_UAVs=num_UAVs, num_customers=num_customers)
 
 # PPO 用 GA 数据预训练
 ga_data_path = os.path.join(base_dir, "maddpgResult", "ga_assignment_for_ppo.jsonl")
@@ -362,10 +453,10 @@ pretrain_ppo_with_ga_data(env, ppo, ga_data_path, num_iters=300)
 # MADDPG 共享 ReplayBuffer（使用新版预分配张量+GMM 分层采样）
 replay_buffer = ReplayBuffer(capacity=20000)
 
-# Phase 1：冻结 MADDPG，先训练 PPO
-freeze_params(maddpg.actor, maddpg.critic, maddpg.target_actor, maddpg.target_critic)
+# Phase 1：冻结 MADDPG，先训练 PPO（target 网络不参与 freeze/unfreeze，只通过 soft_update 更新）
+freeze_params(maddpg.actor, maddpg.critic)
 training_who = "ppo"
-print(f"[训练] Phase 1: 冻结 MADDPG，训练 PPO")
+print(f"[训练] Phase 1: 冻结 MADDPG，训练 PPO（动态客户按环境默认配置运行）")
 
 # ==========================
 # 训练配置
@@ -375,20 +466,26 @@ update_interval = 20
 num_updates_per_interval = 3
 step_counter = 0
 
-ppo_terminal_cost_weight = 1e-4
+# PPO 每次更新前累计的最小时间步数（按 remember 次数计）
+ppo_update_every_steps = 50
+warmup_episodes_after_switch = 30  # 切换后预热期：只收集数据不更新
 
 max_episodes = 10000
 min_episodes_before_switch = 100
-convergence_window_init = 30
-convergence_cv_init = 0.15
-convergence_window_alt = 50
-convergence_cv_alt = 0.10
+_cv_schedule     = [0.20, 0.18, 0.15, 0.12, 0.10, 0.08]
+_window_schedule = [  30,   35,   40,   45,   50,   50]
 recent_costs = []
 phase_start_episode = 0
 num_alternations = 0
+warmup_remaining = 0  # 切换后预热倒计时
+
+max_full_cycles_per_seed = 2  # 每批客户点最多完成几个完整 PPO-MADDPG 交替周期后轮换
+full_cycle_count = 0  # 当前客户点上已完成的完整周期数
+num_seed_rotations = 0  # 已完成的客户点轮换次数
+max_seed_rotations = 30  # 最大客户轮换次数
 
 epsilon_when_training = 0.10
-epsilon_when_frozen = 0.02
+epsilon_when_frozen = 0.0
 
 # 日志路径
 result_dir = os.path.join(base_dir, "result")
@@ -398,7 +495,8 @@ writer = SummaryWriter(log_dir=log_dir)
 
 log_file_path = os.path.join(result_dir, "training_log.txt")
 seed_log_file_path = os.path.join(result_dir, "convergence_log.txt")
-for p in [log_file_path, seed_log_file_path]:
+ppo_assign_log_path = os.path.join(result_dir, "ppo_assignment_log.txt")
+for p in [log_file_path, seed_log_file_path, ppo_assign_log_path]:
     if os.path.exists(p):
         open(p, 'w').close()
 
@@ -417,6 +515,8 @@ for episode in range(max_episodes):
     train_maddpg = (training_who == "maddpg")
     current_epsilon = epsilon_when_training if train_maddpg else epsilon_when_frozen
 
+    ppo_deterministic = not train_ppo
+
     UAV_rewards = [0.0 for _ in range(num_UAVs)]
     UAV_routes = [[] for _ in range(num_UAVs)]
     UAV_costs = [0.0 for _ in range(num_UAVs)]
@@ -427,62 +527,85 @@ for episode in range(max_episodes):
     episode_steps = 0
     UAV_obs = env.reset()
     done = False
+    ppo_assign_records = []
+    initial_assignment_done = False  # 用于区分初始分配 vs 动态新客户
 
     while not done:
         x, y, d = env.customer_list()
-        x_tensor = torch.tensor(x, dtype=torch.float32).squeeze().to(device)
-        y_tensor = torch.tensor(y, dtype=torch.float32).squeeze().to(device)
-        d_tensor = torch.tensor(d, dtype=torch.float32).squeeze().to(device)
+        x_tensor = torch.as_tensor(np.asarray(x, dtype=np.float32), device=device).squeeze()
+        y_tensor = torch.as_tensor(np.asarray(y, dtype=np.float32), device=device).squeeze()
+        d_tensor = torch.as_tensor(np.asarray(d, dtype=np.float32), device=device).squeeze()
 
-        UAV_obs_array = np.array(UAV_obs)
-        UAV_obs_tensor = torch.tensor(UAV_obs_array, dtype=torch.float32).to(device)
+        UAV_obs_tensor = torch.as_tensor(np.array(UAV_obs), dtype=torch.float32, device=device)
 
         task = UAV_obs_tensor[:, -num_customers:]
 
-        # PPO 分配：未分配的客户点（task 列全 0）
-        for i in range(num_customers):
-            if torch.all(task[:, i] == 0):
+        # PPO 分配：未分配的客户点（列全 0）或动态新客户（列含 -2）
+        pending_customers = [i for i in range(num_customers) if bool(torch.all(task[:, i] == 0)) or bool(torch.any(task[:, i] == -2))]
+        if pending_customers:
+            for i in pending_customers:
                 x_i_tensor = x_tensor[i].unsqueeze(0)
                 y_i_tensor = y_tensor[i].unsqueeze(0)
                 d_i_tensor = d_tensor[i].unsqueeze(0)
 
                 assignment_action, uav_action, log_prob, value, ppo_state = ppo.select_action(
-                    x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor
+                    x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor,
+                    deterministic=ppo_deterministic
                 )
 
                 selected_customer_tensor = torch.tensor(i, dtype=torch.float32).unsqueeze(0).to(device)
                 next_UAV_obs, reward_CA, done_CA, cost_CA = env.step_CA(assignment_action, selected_customer_tensor)
 
+                # 采用基础版奖励：当前所选 UAV 从当前位置到该客户点的旅行时间（越短越好）
+                travel_time = float(cost_CA) / env.fix_v
+                reward_ppo = -travel_time
+
+                assigned_uav_idx = int(uav_action.item())
+                is_new_customer = bool(torch.any(task[:, i] == -2))
+                tag = "[动态新客户] " if is_new_customer else ""
+                ppo_assign_records.append(
+                    f"  {tag}客户{i} -> UAV{assigned_uav_idx}, T_travel={travel_time:.4f}, r={reward_ppo:.4f}"
+                )
+
                 if train_ppo:
                     ppo.remember(ppo_state, uav_action, log_prob,
-                                 reward=float(reward_CA), done=bool(done_CA), value=value)
+                                 reward=reward_ppo, done=bool(done_CA), value=value)
 
                 UAV_obs = next_UAV_obs
-                UAV_obs_array = np.array(UAV_obs)
-                UAV_obs_tensor = torch.tensor(UAV_obs_array, dtype=torch.float32).to(device)
+                UAV_obs_tensor = torch.as_tensor(np.array(UAV_obs), dtype=torch.float32, device=device)
                 task = UAV_obs_tensor[:, -num_customers:]
 
-        # PPO 重分配：故障导致的 -1 标记
-        for i in range(num_customers):
-            if torch.any(task[:, i] == -1):
+        # PPO 故障重分配：UAV 故障导致的 -1 标记（某 UAV 的 1 -> -1）
+        reassign_customers = [i for i in range(num_customers) if bool(torch.any(task[:, i] == -1))]
+        if reassign_customers:
+            for i in reassign_customers:
                 x_i_tensor = x_tensor[i].unsqueeze(0)
                 y_i_tensor = y_tensor[i].unsqueeze(0)
                 d_i_tensor = d_tensor[i].unsqueeze(0)
 
                 assignment_action, uav_action, log_prob, value, ppo_state = ppo.select_action(
-                    x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor
+                    x_i_tensor, y_i_tensor, d_i_tensor, UAV_obs_tensor,
+                    deterministic=ppo_deterministic
                 )
 
                 selected_customer_tensor = torch.tensor(i, dtype=torch.float32).unsqueeze(0).to(device)
                 next_UAV_obs, reward_CA, done_CA, cost_CA = env.step_CA(assignment_action, selected_customer_tensor)
 
+                # 采用基础版奖励：当前所选 UAV 从当前位置到该客户点的旅行时间（越短越好）
+                travel_time = float(cost_CA) / env.fix_v
+                reward_ppo = -travel_time
+
+                assigned_uav_idx = int(uav_action.item())
+                ppo_assign_records.append(
+                    f"  [重分配] 客户{i} -> UAV{assigned_uav_idx}, T_travel={travel_time:.4f}, r={reward_ppo:.4f}"
+                )
+
                 if train_ppo:
                     ppo.remember(ppo_state, uav_action, log_prob,
-                                 reward=float(reward_CA), done=bool(done_CA), value=value)
+                                 reward=reward_ppo, done=bool(done_CA), value=value)
 
                 UAV_obs = next_UAV_obs
-                UAV_obs_array = np.array(UAV_obs)
-                UAV_obs_tensor = torch.tensor(UAV_obs_array, dtype=torch.float32).to(device)
+                UAV_obs_tensor = torch.as_tensor(np.array(UAV_obs), dtype=torch.float32, device=device)
                 task = UAV_obs_tensor[:, -num_customers:]
 
         # MADDPG 路径规划
@@ -493,8 +616,7 @@ for episode in range(max_episodes):
         selected_UAV_tensor = torch.tensor(selected_UAV, dtype=torch.float32, device=device).unsqueeze(0)
         samp_number_tensor = torch.tensor(samp_number, dtype=torch.float32, device=device).unsqueeze(0)
 
-        UAV_obs_array = np.array(UAV_obs)
-        UAV_obs_tensor = torch.tensor(UAV_obs_array, dtype=torch.float32).to(device)
+        UAV_obs_tensor = torch.as_tensor(np.array(UAV_obs), dtype=torch.float32, device=device)
         UAV_obs_tensor_i = UAV_obs_tensor[selected_UAV].clone()
 
         maintenance_action, routing_action = maddpg.select_action(
@@ -516,8 +638,9 @@ for episode in range(max_episodes):
             rewards_tensor, next_UAV_obs_tensor, done_tensor, selected_UAV_tensor,
         )
 
-        # MADDPG 更新（仅在训练 MADDPG 时）
+        # MADDPG 更新（仅在训练 MADDPG 时，且预热期结束后）
         if (train_maddpg
+                and warmup_remaining <= 0
                 and step_counter % update_interval == 0
                 and replay_buffer.size() >= maddpg.batch_size):
             for _ in range(num_updates_per_interval):
@@ -532,8 +655,8 @@ for episode in range(max_episodes):
                 )
                 episode_critic_loss += c_loss
                 episode_actor_loss += a_loss
-            writer.add_scalar('maddpg/critic_loss_step', c_loss, step_counter)
-            writer.add_scalar('maddpg/actor_loss_step', a_loss, step_counter)
+            writer.add_scalar('maddpg/step_critic_loss', c_loss, step_counter)
+            writer.add_scalar('maddpg/step_actor_loss', a_loss, step_counter)
 
         dest = int(routing_action.item() if hasattr(routing_action, "item") else routing_action)
         if isinstance(selected_UAV, torch.Tensor):
@@ -547,59 +670,81 @@ for episode in range(max_episodes):
         UAV_obs = next_UAV_obs
         step_counter += 1
         episode_steps += 1
+        initial_assignment_done = True  # 已做过至少一次路由，之后出现的状态0均为动态新客户
 
     total_reward = sum(UAV_rewards)
     total_cost = sum(UAV_costs)
     episode_reward = total_reward
     episode_cost = total_cost
 
-    # PPO 更新（仅在训练 PPO 时）
+    # 计算各 UAV 完成时间与 makespan（T_max = max_i T_i）
+    uav_completion_times = [float(env.UAV_state["8_decision_time"][i, 0]) for i in range(num_UAVs)]
+    T_max = max(uav_completion_times) if uav_completion_times else 0.0
+    T_min = min(uav_completion_times) if uav_completion_times else 0.0
+
+    # PPO：按累计 timestep 的更新
     if train_ppo and len(ppo.buffer.rewards) > 0:
-        episode_cost_scalar = float(episode_cost)
-        ppo.buffer.rewards[-1] += -ppo_terminal_cost_weight * episode_cost_scalar
-
+        # 记录当前 PPO buffer 的整体统计信息（跨 episode）
         ppo_rewards_arr = np.array(ppo.buffer.rewards, dtype=np.float32)
-        writer.add_scalar('ppo/mean_step_reward', float(ppo_rewards_arr.mean()), episode)
-        writer.add_scalar('ppo/total_step_reward', float(ppo_rewards_arr.sum()), episode)
-        writer.add_scalar('ppo/num_steps', int(ppo_rewards_arr.shape[0]), episode)
+        writer.add_scalar('ppo/buffer_mean_reward', float(ppo_rewards_arr.mean()), episode)
+        writer.add_scalar('ppo/buffer_total_reward', float(ppo_rewards_arr.sum()), episode)
+        writer.add_scalar('ppo/buffer_num_steps', int(ppo_rewards_arr.shape[0]), episode)
 
-        ppo.buffer.is_terminals[-1] = True
-        ppo.update()
+        # 按累计 timestep 触发 PPO 参数更新，并记录更新诊断信息
+        if len(ppo.buffer.rewards) >= ppo_update_every_steps:
+            update_info = ppo.update()
+            if update_info is not None:
+                writer.add_scalar('ppo/update_actor_loss', update_info["actor_loss"], episode)
+                writer.add_scalar('ppo/update_critic_loss', update_info["critic_loss"], episode)
+                writer.add_scalar('ppo/update_approx_kl', update_info["approx_kl"], episode)
+                writer.add_scalar('ppo/update_clip_fraction', update_info["clip_fraction"], episode)
 
-    # TensorBoard
-    writer.add_scalar('episode/total_reward', episode_reward, episode)
-    writer.add_scalar('episode/total_cost', episode_cost, episode)
-    writer.add_scalar('episode/steps', episode_steps, episode)
-    writer.add_scalar('episode/buffer_size', replay_buffer.size(), episode)
+    if warmup_remaining > 0:
+        warmup_remaining -= 1
+
+    # TensorBoard：简化且命名更清晰
+    writer.add_scalar('env/episode_total_reward', episode_reward, episode)
+    writer.add_scalar('env/episode_total_cost', episode_cost, episode)
+    writer.add_scalar('env/episode_T_max', T_max, episode)
+    writer.add_scalar('env/episode_steps', episode_steps, episode)
+    writer.add_scalar('buffer/replay_size', replay_buffer.size(), episode)
     if episode_critic_loss != 0.0:
-        writer.add_scalar('episode/critic_loss_sum', episode_critic_loss, episode)
-        writer.add_scalar('episode/actor_loss_sum', episode_actor_loss, episode)
-    writer.add_scalar('training/who', 0.0 if training_who == "ppo" else 1.0, episode)
+        writer.add_scalar('maddpg/episode_critic_loss_sum', episode_critic_loss, episode)
+        writer.add_scalar('maddpg/episode_actor_loss_sum', episode_actor_loss, episode)
+    writer.add_scalar('training/phase_id', 0.0 if training_who == "ppo" else 1.0, episode)
     writer.add_scalar('training/num_alternations', num_alternations, episode)
     writer.flush()
 
     if episode % 10 == 0 or episode < 3:
         print(f"[Ep {episode}] training={training_who}, steps={episode_steps}, "
               f"reward={episode_reward:.2f}, cost={episode_cost:.4f}, "
+              f"T_max={T_max:.4f}, T_spread={T_max - T_min:.4f}, "
               f"buffer={replay_buffer.size()}, alt={num_alternations}")
 
     with open(log_file_path, 'a', encoding='utf-8') as f:
         f.write(f"Episode {episode}: training={training_who}, reward={episode_reward:.4f}, "
-                f"cost={episode_cost:.4f}, steps={episode_steps}\n")
+                f"cost={episode_cost:.4f}, T_max={T_max:.4f}, steps={episode_steps}\n")
         for i in range(num_UAVs):
-            f.write(f"  UAV{i}: {' -> '.join(map(str, UAV_routes[i]))}\n")
+            f.write(f"  UAV{i}: T={uav_completion_times[i]:.4f}, "
+                    f"route={' -> '.join(map(str, UAV_routes[i]))}\n")
 
-    # 收敛检测（基于 CV）
-    _cost = float(episode_cost)
+    if ppo_assign_records:
+        with open(ppo_assign_log_path, 'a', encoding='utf-8') as f:
+            f.write(f"Episode {episode} (training={training_who}):\n")
+            for rec in ppo_assign_records:
+                f.write(rec + "\n")
+
+    # 收敛检测（基于 CV）：PPO 阶段用 T_max（与其优化目标对齐），MADDPG 阶段用路由总成本
+    if training_who == "ppo":
+        _cost = float(T_max)
+    else:
+        _cost = float(episode_cost)
     recent_costs.append(_cost)
 
     phase_ep_count = episode - phase_start_episode
-    if num_alternations == 0:
-        conv_window = convergence_window_init
-        conv_cv = convergence_cv_init
-    else:
-        conv_window = convergence_window_alt
-        conv_cv = convergence_cv_alt
+    _sched_idx = min(num_alternations, len(_cv_schedule) - 1)
+    conv_cv = _cv_schedule[_sched_idx]
+    conv_window = _window_schedule[_sched_idx]
 
     if len(recent_costs) > conv_window:
         recent_costs.pop(0)
@@ -620,19 +765,28 @@ for episode in range(max_episodes):
     if converged:
         if training_who == "ppo":
             freeze_params(ppo.actor, ppo.critic)
-            unfreeze_params(maddpg.actor, maddpg.critic, maddpg.target_actor, maddpg.target_critic)
+            unfreeze_params(maddpg.actor, maddpg.critic)
+            maddpg.actor_optimizer = optim.Adam(maddpg.actor.parameters(), lr=5e-5)
+            maddpg.critic_optimizer = optim.Adam(maddpg.critic.parameters(), lr=5e-5)
+            replay_buffer = ReplayBuffer(capacity=20000)
+            warmup_remaining = warmup_episodes_after_switch
             training_who = "maddpg"
-            print(f"[切换] 冻结 PPO，解冻 MADDPG 开始训练")
+            print(f"[切换] 冻结 PPO，解冻 MADDPG 开始训练（预热 {warmup_episodes_after_switch} ep）")
         else:
-            freeze_params(maddpg.actor, maddpg.critic, maddpg.target_actor, maddpg.target_critic)
+            freeze_params(maddpg.actor, maddpg.critic)
             unfreeze_params(ppo.actor, ppo.critic)
+            ppo.optimizer_actor = optim.Adam(ppo.actor.parameters(), lr=5e-5)
+            ppo.optimizer_critic = optim.Adam(ppo.critic.parameters(), lr=5e-5)
             training_who = "ppo"
-            print(f"[切换] 冻结 MADDPG，解冻 PPO 开始训练")
+            full_cycle_count += 1
+            print(f"[切换] 冻结 MADDPG，解冻 PPO 开始训练（周期 {full_cycle_count}/{max_full_cycles_per_seed}）")
 
         num_alternations += 1
         recent_costs = []
         phase_start_episode = episode + 1
         writer.add_scalar('training/alternation_event', num_alternations, episode)
+
+        # 不再在两个阶段各收敛一次后自动更换客户点，始终在同一批客户点上训练
 
     if (episode + 1) >= max_episodes:
         print(f"已达到最大训练轮数 {max_episodes}，结束训练。")

@@ -1,24 +1,22 @@
 ==== 出现损坏的 Episode 记录（来自 env.broken_events）====
-总损坏次数: 19
+总损坏次数: 17
 
-涉及 episode 列表: [306, 1036, 1733, 2116, 2767, 2788, 3005, 3392, 3522, 3921, 4046, 5356, 5454, 6101, 8034, 8278, 8459, 8693, 9610]
+涉及 episode 列表: [349, 688, 963, 2060, 2640, 3100, 3253, 3461, 6132, 6275, 6598, 7283, 8072, 8212, 9236, 9446, 9815]
 
-  episode=306 step=10 uav_id=0 position=8.0 destination=4.0 age=0.35020333528518677 energy=99.42972564697266
-  episode=1036 step=15 uav_id=1 position=10.0 destination=0.0 age=0.5524314045906067 energy=100.0
-  episode=1733 step=12 uav_id=2 position=4.0 destination=0.0 age=0.2846324145793915 energy=100.0
-  episode=2116 step=5 uav_id=1 position=0.0 destination=1.0 age=0.1646643877029419 energy=99.73249816894531
-  episode=2767 step=6 uav_id=2 position=0.0 destination=3.0 age=0.16522622108459473 energy=99.80647277832031
-  episode=2788 step=18 uav_id=0 position=4.0 destination=0.0 age=0.7385537624359131 energy=100.0
-  episode=3005 step=0 uav_id=0 position=0.0 destination=7.0 age=0.0979004055261612 energy=99.7335433959961
-  episode=3392 step=7 uav_id=0 position=4.0 destination=0.0 age=0.20718033611774445 energy=100.0
-  episode=3522 step=14 uav_id=0 position=8.0 destination=0.0 age=0.30508852005004883 energy=100.0
-  episode=3921 step=2 uav_id=2 position=0.0 destination=7.0 age=0.09156195819377899 energy=99.75080108642578
-  episode=4046 step=10 uav_id=1 position=3.0 destination=0.0 age=0.30338382720947266 energy=100.0
-  episode=5356 step=15 uav_id=0 position=1.0 destination=0.0 age=0.4026537239551544 energy=100.0
-  episode=5454 step=16 uav_id=0 position=0.0 destination=8.0 age=0.48141375184059143 energy=99.74946594238281
-  episode=6101 step=16 uav_id=0 position=8.0 destination=0.0 age=0.6744062304496765 energy=100.0
-  episode=8034 step=14 uav_id=1 position=1.0 destination=0.0 age=0.35266488790512085 energy=100.0
-  episode=8278 step=3 uav_id=1 position=9.0 destination=0.0 age=0.1673135608434677 energy=100.0
-  episode=8459 step=11 uav_id=0 position=1.0 destination=10.0 age=0.3451096713542938 energy=99.58944702148438
-  episode=8693 step=15 uav_id=0 position=0.0 destination=1.0 age=0.4796420633792877 energy=99.82823944091797
-  episode=9610 step=10 uav_id=1 position=0.0 destination=1.0 age=0.25272417068481445 energy=99.80618286132812
+  episode=349 step=11 uav_id=0 position=0.0 destination=10.0 age=0.3281528055667877 energy=99.75213623046875
+  episode=688 step=13 uav_id=1 position=10.0 destination=2.0 age=0.5830360054969788 energy=99.34861755371094
+  episode=963 step=7 uav_id=1 position=8.0 destination=10.0 age=0.20745404064655304 energy=99.28934478759766
+  episode=2060 step=13 uav_id=2 position=2.0 destination=0.0 age=0.23554031550884247 energy=100.0
+  episode=2640 step=11 uav_id=0 position=0.0 destination=4.0 age=0.31868603825569153 energy=99.82451629638672
+  episode=3100 step=13 uav_id=1 position=1.0 destination=0.0 age=0.3500432074069977 energy=100.0
+  episode=3253 step=13 uav_id=1 position=1.0 destination=0.0 age=0.3500432074069977 energy=100.0
+  episode=3461 step=14 uav_id=1 position=10.0 destination=0.0 age=0.34722840785980225 energy=100.0
+  episode=6132 step=1 uav_id=1 position=0.0 destination=4.0 age=0.07401417940855026 energy=99.7985610961914
+  episode=6275 step=6 uav_id=0 position=8.0 destination=7.0 age=0.15265433490276337 energy=99.536376953125
+  episode=6598 step=11 uav_id=0 position=0.0 destination=10.0 age=0.2927497625350952 energy=99.73516845703125
+  episode=7283 step=16 uav_id=0 position=4.0 destination=0.0 age=0.5695129632949829 energy=100.0
+  episode=8072 step=9 uav_id=0 position=0.0 destination=6.0 age=0.22454175353050232 energy=99.75473022460938
+  episode=8212 step=13 uav_id=1 position=9.0 destination=0.0 age=0.4218180179595947 energy=100.0
+  episode=9236 step=12 uav_id=1 position=0.0 destination=6.0 age=0.2830939292907715 energy=99.81262969970703
+  episode=9446 step=9 uav_id=0 position=4.0 destination=0.0 age=0.2572728097438812 energy=100.0
+  episode=9815 step=13 uav_id=1 position=0.0 destination=9.0 age=0.3067317605018616 energy=99.92964172363281
