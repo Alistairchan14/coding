@@ -1,4 +1,0 @@
-ppo 收敛于 episode 100 (CV=0.1570, mean_cost=0.0288, alternation=0)
-maddpg 收敛于 episode 232 (CV=0.1776, mean_cost=0.0640, alternation=1)
-ppo 收敛于 episode 364 (CV=0.1497, mean_cost=0.0273, alternation=2)
-maddpg 收敛于 episode 465 (CV=0.0768, mean_cost=0.0243, alternation=3)

@@ -102,6 +102,10 @@ class Environment(gym.Env):
         self.broken_events = []            # 记录无人机损坏事件
         self.dynamic_customer_events = []  # 记录动态新客户出现事件
         self.current_episode = 0           # 由训练主循环在每个 episode 开始时设置
+        self.dynamic_episode_active = False
+        self.dynamic_new_remaining = int(self.config.get('dynamic_max_new_per_episode', 0))
+        self.dynamic_customer_counter = 0
+        self.customer_instance_ids = [f"base-{j}" for j in range(self.num_customers)]
 
     def generate_customer_positions(self,seed):
         "生成客户点坐标"
@@ -143,14 +147,21 @@ class Environment(gym.Env):
     def _maybe_spawn_new_customers(self):
         """
         动态客户到达逻辑：
-        - 找到已经“完全空闲”的客户槽（所有 UAV 行均为 2 或 -1，表示该槽对应的历史任务已结束）
+        - 每个 episode 开始先用 dynamic_episode_prob 判定该轮是否启用动态客户
+        - 启用后，在每一步随机时刻按 dynamic_customer_prob 尝试生成新客户
+        - 找到已经“完全空闲”的客户槽（列全为 2）作为可复用槽位
         - 以 dynamic_customer_prob 的概率，在这些槽中最多生成 dynamic_max_new_per_step 个新客户
-        - 新客户的位置和需求按原始分布重新采样，状态重置为 0（未分配）
+        - 新客户的位置和需求按原始分布重新采样（不是复用旧坐标）
         - 更新 distance_matrix 以反映位置变化
         """
+        if not self.dynamic_episode_active:
+            return
         prob = self.config.get('dynamic_customer_prob', 0.0)
         max_new = self.config.get('dynamic_max_new_per_step', 0)
+        max_new_episode = int(self.config.get('dynamic_max_new_per_episode', 0))
         if prob <= 0.0 or max_new <= 0:
+            return
+        if max_new_episode > 0 and self.dynamic_new_remaining <= 0:
             return
 
         # 候选槽：仅当该列全为 2（已完成）时才可生成新客户。
@@ -169,6 +180,8 @@ class Environment(gym.Env):
         for j in candidates:
             if new_count >= max_new:
                 break
+            if max_new_episode > 0 and self.dynamic_new_remaining <= 0:
+                break
             if np.random.rand() < prob:
                 # 重新采样该槽对应客户的位置与需求
                 x, y = self._sample_single_customer_position()
@@ -177,16 +190,22 @@ class Environment(gym.Env):
                 self.customer_cargo_demands[j] = d
                 # 用 -2 标记动态新客户，与初始未分配(0)、故障重分配(-1) 区分
                 self.customer_state_space[:, j] = -2
+                self.dynamic_customer_counter += 1
+                instance_id = f"dyn-{self.dynamic_customer_counter}"
+                self.customer_instance_ids[j] = instance_id
                 # 记录动态新客户事件
                 self.dynamic_customer_events.append({
                     "episode": int(self.current_episode),
                     "step": int(self.current_step),
                     "customer_index": int(j),
+                    "customer_instance_id": instance_id,
                     "x": float(x),
                     "y": float(y),
                     "demand": float(d)
                 })
                 new_count += 1
+                if max_new_episode > 0:
+                    self.dynamic_new_remaining -= 1
 
         # 若产生了新客户，重新计算距离矩阵
         if new_count > 0:
@@ -239,9 +258,11 @@ class Environment(gym.Env):
             'weibull_shape': 1.5,  # 威布尔分布的形状参数
             'weibull_scale': 100,  # 威布尔分布的尺度参数
             'weibull_function': lambda size=None: weibull_min(config['weibull_shape'], config['weibull_scale'], size),
-            # 动态客户到达：每步为每个“已完成客户槽”生成新客户的概率及上限
-            'dynamic_customer_prob': 0.1,       # 单个候选槽在一步中产生新客户的概率
-            'dynamic_max_new_per_step': 2       # 每步最多产生的新客户数
+            # 动态客户到达：每个 episode 先判定是否启用，再在步骤中随机时刻出现
+            'dynamic_episode_prob': 0.3,        # episode 级概率：该轮是否存在动态客户到达
+            'dynamic_customer_prob': 0.02,      # 单个候选槽在一步中产生新客户的概率
+            'dynamic_max_new_per_step': 1,      # 每步最多产生的新客户数
+            'dynamic_max_new_per_episode': 3    # 每个 episode 动态新客户总上限（0 表示不限制）
         }
         return config
     
@@ -307,6 +328,10 @@ class Environment(gym.Env):
         self.current_step = 0  # 重置当前时间步
         self.done = False  # 重置 done 标志
         self.total_reward = 0  # 重置累计奖励
+        episode_prob = float(self.config.get('dynamic_episode_prob', 0.0))
+        self.dynamic_episode_active = bool(np.random.rand() < max(0.0, min(1.0, episode_prob)))
+        self.dynamic_new_remaining = int(self.config.get('dynamic_max_new_per_episode', 0))
+        self.customer_instance_ids = [f"base-{j}" for j in range(self.num_customers)]
 
         # 3. 生成并返回初始观测
         UAV_obs = []

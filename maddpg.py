@@ -189,6 +189,7 @@ class ReplayBuffer:
         self._cached_comp_indices = {}
         self._distinct_nums = set()
         self._distinct_sels = set()
+        self.last_sample_stats = None
 
     @staticmethod
     def _to_scalar(x):
@@ -293,6 +294,7 @@ class ReplayBuffer:
         counts[-1] += batch_size - sum(counts)
 
         sampled_idx = []
+        sampled_counts = [0 for _ in range(n_comp)]
         for h in range(n_comp):
             group = comp_indices.get(h, [])
             if not group:
@@ -300,6 +302,7 @@ class ReplayBuffer:
             c = min(counts[h], len(group))
             chosen = np.random.choice(group, size=c, replace=(c > len(group)))
             sampled_idx.extend(chosen.tolist())
+            sampled_counts[h] += int(c)
 
         if len(sampled_idx) < batch_size:
             extra = np.random.choice(N, size=batch_size - len(sampled_idx), replace=True)
@@ -307,6 +310,17 @@ class ReplayBuffer:
 
         np.random.shuffle(sampled_idx)
         sampled_idx = sampled_idx[:batch_size]
+
+        total_selected = max(1, len(sampled_idx))
+        final_counts = [0 for _ in range(n_comp)]
+        for idx in sampled_idx:
+            comp_id = int(self._cached_labels[idx])
+            if 0 <= comp_id < n_comp:
+                final_counts[comp_id] += 1
+        self.last_sample_stats = {
+            "n_components": int(n_comp),
+            "batch_component_ratio": [float(c) / float(total_selected) for c in final_counts],
+        }
 
         indices = torch.tensor(sampled_idx, dtype=torch.long)
 

@@ -1,22 +1,27 @@
 ==== 出现损坏的 Episode 记录（来自 env.broken_events）====
-总损坏次数: 17
+总损坏次数: 22
 
-涉及 episode 列表: [349, 688, 963, 2060, 2640, 3100, 3253, 3461, 6132, 6275, 6598, 7283, 8072, 8212, 9236, 9446, 9815]
+涉及 episode 列表: [8, 94, 643, 1052, 1087, 3790, 4025, 4152, 4213, 4439, 4866, 4949, 5562, 6199, 7584, 8317, 8360, 8422, 8484, 8924, 9144, 9489]
 
-  episode=349 step=11 uav_id=0 position=0.0 destination=10.0 age=0.3281528055667877 energy=99.75213623046875
-  episode=688 step=13 uav_id=1 position=10.0 destination=2.0 age=0.5830360054969788 energy=99.34861755371094
-  episode=963 step=7 uav_id=1 position=8.0 destination=10.0 age=0.20745404064655304 energy=99.28934478759766
-  episode=2060 step=13 uav_id=2 position=2.0 destination=0.0 age=0.23554031550884247 energy=100.0
-  episode=2640 step=11 uav_id=0 position=0.0 destination=4.0 age=0.31868603825569153 energy=99.82451629638672
-  episode=3100 step=13 uav_id=1 position=1.0 destination=0.0 age=0.3500432074069977 energy=100.0
-  episode=3253 step=13 uav_id=1 position=1.0 destination=0.0 age=0.3500432074069977 energy=100.0
-  episode=3461 step=14 uav_id=1 position=10.0 destination=0.0 age=0.34722840785980225 energy=100.0
-  episode=6132 step=1 uav_id=1 position=0.0 destination=4.0 age=0.07401417940855026 energy=99.7985610961914
-  episode=6275 step=6 uav_id=0 position=8.0 destination=7.0 age=0.15265433490276337 energy=99.536376953125
-  episode=6598 step=11 uav_id=0 position=0.0 destination=10.0 age=0.2927497625350952 energy=99.73516845703125
-  episode=7283 step=16 uav_id=0 position=4.0 destination=0.0 age=0.5695129632949829 energy=100.0
-  episode=8072 step=9 uav_id=0 position=0.0 destination=6.0 age=0.22454175353050232 energy=99.75473022460938
-  episode=8212 step=13 uav_id=1 position=9.0 destination=0.0 age=0.4218180179595947 energy=100.0
-  episode=9236 step=12 uav_id=1 position=0.0 destination=6.0 age=0.2830939292907715 energy=99.81262969970703
-  episode=9446 step=9 uav_id=0 position=4.0 destination=0.0 age=0.2572728097438812 energy=100.0
-  episode=9815 step=13 uav_id=1 position=0.0 destination=9.0 age=0.3067317605018616 energy=99.92964172363281
+  episode=8 step=13 uav_id=1 position=0.0 destination=4.0 age=0.9655342102050781 energy=99.75570678710938
+  episode=94 step=7 uav_id=2 position=0.0 destination=10.0 age=0.15312373638153076 energy=99.98534393310547
+  episode=643 step=14 uav_id=1 position=0.0 destination=10.0 age=0.8447242975234985 energy=99.8388671875
+  episode=1052 step=14 uav_id=1 position=0.0 destination=9.0 age=0.6311803460121155 energy=99.75794982910156
+  episode=1087 step=14 uav_id=1 position=8.0 destination=5.0 age=0.6910542845726013 energy=99.19261932373047
+  episode=3790 step=18 uav_id=0 position=0.0 destination=5.0 age=0.5980737209320068 energy=99.86333465576172
+  episode=4025 step=19 uav_id=0 position=9.0 destination=0.0 age=0.5256768465042114 energy=100.0
+  episode=4152 step=3 uav_id=0 position=7.0 destination=0.0 age=0.10211007297039032 energy=100.0
+  episode=4213 step=10 uav_id=2 position=5.0 destination=0.0 age=0.23626874387264252 energy=100.0
+  episode=4439 step=14 uav_id=2 position=0.0 destination=2.0 age=0.3631158769130707 energy=99.79042053222656
+  episode=4866 step=19 uav_id=0 position=8.0 destination=0.0 age=0.7094346880912781 energy=100.0
+  episode=4949 step=17 uav_id=0 position=5.0 destination=0.0 age=0.5530725121498108 energy=100.0
+  episode=5562 step=18 uav_id=0 position=5.0 destination=0.0 age=0.7105198502540588 energy=100.0
+  episode=6199 step=10 uav_id=0 position=3.0 destination=0.0 age=0.2560528814792633 energy=100.0
+  episode=7584 step=15 uav_id=0 position=5.0 destination=0.0 age=0.3931308686733246 energy=100.0
+  episode=8317 step=14 uav_id=1 position=9.0 destination=0.0 age=0.32850930094718933 energy=100.0
+  episode=8360 step=12 uav_id=1 position=0.0 destination=8.0 age=0.2602505087852478 energy=99.78619384765625
+  episode=8422 step=16 uav_id=1 position=10.0 destination=0.0 age=0.43492749333381653 energy=100.0
+  episode=8484 step=16 uav_id=1 position=0.0 destination=4.0 age=0.46663203835487366 energy=99.76715087890625
+  episode=8924 step=15 uav_id=2 position=7.0 destination=0.0 age=0.34533849358558655 energy=100.0
+  episode=9144 step=13 uav_id=0 position=2.0 destination=0.0 age=0.30246853828430176 energy=100.0
+  episode=9489 step=14 uav_id=1 position=0.0 destination=7.0 age=0.3323603868484497 energy=99.80484771728516

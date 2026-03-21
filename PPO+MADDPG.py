@@ -98,7 +98,7 @@ class RolloutBuffer:
 # ==========================
 class PPO:
     def __init__(self, UAV_input_dim, num_UAVs, num_customers,
-                 lr_actor=2e-5, lr_critic=2e-5, gamma=0.99,
+                 lr_actor=5e-5, lr_critic=5e-5, gamma=0.99,
                  k_epochs=4, eps_clip=0.15, hidden_dim=128,
                  gae_lambda=0.95):
         self.UAV_input_dim = UAV_input_dim
@@ -232,6 +232,15 @@ class PPO:
         else:
             value_val = float(value)
         self.buffer.values.append(value_val)
+        return len(self.buffer.rewards) - 1
+
+    def set_transition(self, idx, reward=None, done=None):
+        if idx < 0 or idx >= len(self.buffer.rewards):
+            return
+        if reward is not None:
+            self.buffer.rewards[idx] = float(reward)
+        if done is not None:
+            self.buffer.is_terminals[idx] = bool(done)
 
     def update(self):
         if len(self.buffer.rewards) == 0:
@@ -256,12 +265,13 @@ class PPO:
             advantages[t] = gae
             next_value = old_values[t]
 
+        # Critic 目标使用“未标准化”优势，避免价值回归目标被标准化扭曲
+        returns = advantages + old_values
+
         # 对优势函数做标准化，有助于稳定 PPO 训练
         adv_mean = advantages.mean()
         adv_std = advantages.std() + 1e-8
         advantages = (advantages - adv_mean) / adv_std
-
-        returns = advantages + old_values
 
         # 统计信息累计（按 epoch 平均）
         total_actor_loss = 0.0
@@ -468,16 +478,19 @@ step_counter = 0
 
 # PPO 每次更新前累计的最小时间步数（按 remember 次数计）
 ppo_update_every_steps = 50
-warmup_episodes_after_switch = 30  # 切换后预热期：只收集数据不更新
+warmup_episodes_after_switch_maddpg = 30  # 切到 MADDPG 后预热：只收集数据不更新
+warmup_episodes_after_switch_ppo = 20      # 切到 PPO 后预热：只收集数据不更新
 
 max_episodes = 10000
 min_episodes_before_switch = 100
+min_ppo_episodes_before_switch = 1000
 _cv_schedule     = [0.20, 0.18, 0.15, 0.12, 0.10, 0.08]
 _window_schedule = [  30,   35,   40,   45,   50,   50]
 recent_costs = []
 phase_start_episode = 0
 num_alternations = 0
 warmup_remaining = 0  # 切换后预热倒计时
+warmup_remaining_ppo = 0
 
 max_full_cycles_per_seed = 2  # 每批客户点最多完成几个完整 PPO-MADDPG 交替周期后轮换
 full_cycle_count = 0  # 当前客户点上已完成的完整周期数
@@ -493,10 +506,11 @@ os.makedirs(result_dir, exist_ok=True)
 log_dir = result_dir
 writer = SummaryWriter(log_dir=log_dir)
 
-log_file_path = os.path.join(result_dir, "training_log.txt")
+route_log_path = os.path.join(result_dir, "maddpg_routing_log.txt")
 seed_log_file_path = os.path.join(result_dir, "convergence_log.txt")
 ppo_assign_log_path = os.path.join(result_dir, "ppo_assignment_log.txt")
-for p in [log_file_path, seed_log_file_path, ppo_assign_log_path]:
+event_log_path = os.path.join(result_dir, "environment_event_log.txt")
+for p in [route_log_path, seed_log_file_path, ppo_assign_log_path, event_log_path]:
     if os.path.exists(p):
         open(p, 'w').close()
 
@@ -528,7 +542,8 @@ for episode in range(max_episodes):
     UAV_obs = env.reset()
     done = False
     ppo_assign_records = []
-    initial_assignment_done = False  # 用于区分初始分配 vs 动态新客户
+    ppo_pending_assignments = {}
+    ppo_episode_settled_rewards = []
 
     while not done:
         x, y, d = env.customer_list()
@@ -554,22 +569,38 @@ for episode in range(max_episodes):
                 )
 
                 selected_customer_tensor = torch.tensor(i, dtype=torch.float32).unsqueeze(0).to(device)
-                next_UAV_obs, reward_CA, done_CA, cost_CA = env.step_CA(assignment_action, selected_customer_tensor)
-
-                # 采用基础版奖励：当前所选 UAV 从当前位置到该客户点的旅行时间（越短越好）
-                travel_time = float(cost_CA) / env.fix_v
-                reward_ppo = -travel_time
+                next_UAV_obs, _, _, _ = env.step_CA(assignment_action, selected_customer_tensor)
 
                 assigned_uav_idx = int(uav_action.item())
                 is_new_customer = bool(torch.any(task[:, i] == -2))
-                tag = "[动态新客户] " if is_new_customer else ""
+                customer_instance_id = env.customer_instance_ids[i] if hasattr(env, "customer_instance_ids") else f"slot-{i}"
+                if is_new_customer:
+                    tag = "[动态新客户分配] "
+                else:
+                    tag = "[初始客户分配] "
                 ppo_assign_records.append(
-                    f"  {tag}客户{i} -> UAV{assigned_uav_idx}, T_travel={travel_time:.4f}, r={reward_ppo:.4f}"
+                    f"  {tag}slot={i}, id={customer_instance_id} -> UAV{assigned_uav_idx}"
                 )
 
                 if train_ppo:
-                    ppo.remember(ppo_state, uav_action, log_prob,
-                                 reward=reward_ppo, done=bool(done_CA), value=value)
+                    # 同一客户重复分配前，先结算旧 pending，避免旧 transition 悬空污染 GAE
+                    if i in ppo_pending_assignments:
+                        prev = ppo_pending_assignments.pop(i)
+                        current_global_time = float(np.max(np.array(UAV_obs, dtype=np.float32)[:, 7]))
+                        prev_elapsed = max(1e-6, current_global_time - float(prev["assign_time"]))
+                        ppo.set_transition(prev["buffer_idx"], reward=-float(prev_elapsed), done=True)
+                        ppo_episode_settled_rewards.append(-float(prev_elapsed))
+                    trans_idx = ppo.remember(
+                        ppo_state, uav_action, log_prob,
+                        reward=0.0, done=False, value=value
+                    )
+                    assigned_uav_idx = int(uav_action.item())
+                    assign_time = float(UAV_obs_tensor[assigned_uav_idx, 7].item())
+                    ppo_pending_assignments[i] = {
+                        "buffer_idx": trans_idx,
+                        "assign_time": assign_time,
+                        "assigned_uav_idx": assigned_uav_idx,
+                    }
 
                 UAV_obs = next_UAV_obs
                 UAV_obs_tensor = torch.as_tensor(np.array(UAV_obs), dtype=torch.float32, device=device)
@@ -589,20 +620,33 @@ for episode in range(max_episodes):
                 )
 
                 selected_customer_tensor = torch.tensor(i, dtype=torch.float32).unsqueeze(0).to(device)
-                next_UAV_obs, reward_CA, done_CA, cost_CA = env.step_CA(assignment_action, selected_customer_tensor)
-
-                # 采用基础版奖励：当前所选 UAV 从当前位置到该客户点的旅行时间（越短越好）
-                travel_time = float(cost_CA) / env.fix_v
-                reward_ppo = -travel_time
+                next_UAV_obs, _, _, _ = env.step_CA(assignment_action, selected_customer_tensor)
 
                 assigned_uav_idx = int(uav_action.item())
+                customer_instance_id = env.customer_instance_ids[i] if hasattr(env, "customer_instance_ids") else f"slot-{i}"
                 ppo_assign_records.append(
-                    f"  [重分配] 客户{i} -> UAV{assigned_uav_idx}, T_travel={travel_time:.4f}, r={reward_ppo:.4f}"
+                    f"  [故障重分配] slot={i}, id={customer_instance_id} -> UAV{assigned_uav_idx}"
                 )
 
                 if train_ppo:
-                    ppo.remember(ppo_state, uav_action, log_prob,
-                                 reward=reward_ppo, done=bool(done_CA), value=value)
+                    # 同一客户重复分配前，先结算旧 pending，避免旧 transition 悬空污染 GAE
+                    if i in ppo_pending_assignments:
+                        prev = ppo_pending_assignments.pop(i)
+                        current_global_time = float(np.max(np.array(UAV_obs, dtype=np.float32)[:, 7]))
+                        prev_elapsed = max(1e-6, current_global_time - float(prev["assign_time"]))
+                        ppo.set_transition(prev["buffer_idx"], reward=-float(prev_elapsed), done=True)
+                        ppo_episode_settled_rewards.append(-float(prev_elapsed))
+                    trans_idx = ppo.remember(
+                        ppo_state, uav_action, log_prob,
+                        reward=0.0, done=False, value=value
+                    )
+                    assigned_uav_idx = int(uav_action.item())
+                    assign_time = float(UAV_obs_tensor[assigned_uav_idx, 7].item())
+                    ppo_pending_assignments[i] = {
+                        "buffer_idx": trans_idx,
+                        "assign_time": assign_time,
+                        "assigned_uav_idx": assigned_uav_idx,
+                    }
 
                 UAV_obs = next_UAV_obs
                 UAV_obs_tensor = torch.as_tensor(np.array(UAV_obs), dtype=torch.float32, device=device)
@@ -611,6 +655,12 @@ for episode in range(max_episodes):
         # MADDPG 路径规划
         selected_UAV = env.selected_UAV()
         if selected_UAV < 0:
+            # 显式终止判定：与环境 done 语义保持一致（全部完成且全部回仓）
+            obs_np = np.array(UAV_obs, dtype=np.float32)
+            task_np = obs_np[:, -num_customers:]
+            all_finished = bool(np.all(~np.isin(task_np, [0, 1, -1, -2])))
+            all_back_to_depot = bool(np.all(obs_np[:, 1] == 0))
+            done = bool(all_finished and all_back_to_depot)
             break
 
         selected_UAV_tensor = torch.tensor(selected_UAV, dtype=torch.float32, device=device).unsqueeze(0)
@@ -655,6 +705,15 @@ for episode in range(max_episodes):
                 )
                 episode_critic_loss += c_loss
                 episode_actor_loss += a_loss
+                sample_stats = getattr(replay_buffer, "last_sample_stats", None)
+                if sample_stats is not None:
+                    ratios = sample_stats.get("batch_component_ratio", [])
+                    for comp_idx, ratio in enumerate(ratios):
+                        writer.add_scalar(
+                            f"gmm/sample_batch_ratio/component_{comp_idx}",
+                            float(ratio),
+                            step_counter
+                        )
             writer.add_scalar('maddpg/step_critic_loss', c_loss, step_counter)
             writer.add_scalar('maddpg/step_actor_loss', a_loss, step_counter)
 
@@ -670,7 +729,37 @@ for episode in range(max_episodes):
         UAV_obs = next_UAV_obs
         step_counter += 1
         episode_steps += 1
-        initial_assignment_done = True  # 已做过至少一次路由，之后出现的状态0均为动态新客户
+
+        # PPO 延迟奖励结算（事件驱动）：
+        # 仅当本步真实完成客户（routing!=0 且 UAV 未故障）时，结算该客户的 pending 记录。
+        if train_ppo:
+            routed_customer = int(routing_action.item() if hasattr(routing_action, "item") else routing_action) - 1
+            step_broken = int(env.UAV_state["7_broken"][sel_int, 0])
+            if routed_customer >= 0 and step_broken == 0 and routed_customer in ppo_pending_assignments:
+                record = ppo_pending_assignments.pop(routed_customer)
+                completion_time = float(env.UAV_state["8_decision_time"][sel_int, 0])
+                completion_time = max(completion_time, float(record["assign_time"]))
+                elapsed_time = max(1e-6, completion_time - float(record["assign_time"]))
+                settled_reward = -float(elapsed_time)
+                ppo_assign_records.append(
+                    f"  [结算] slot={routed_customer}, assigned_uav={record.get('assigned_uav_idx', -1)}, "
+                    f"executed_uav={sel_int}, assign_t={record['assign_time']:.4f}, "
+                    f"finish_t={completion_time:.4f}, dt={elapsed_time:.4f}, r={settled_reward:.4f}"
+                )
+                ppo.set_transition(record["buffer_idx"], reward=settled_reward, done=True)
+                ppo_episode_settled_rewards.append(settled_reward)
+
+    # 对回合末仍未完成的分配做兜底结算，避免大量 0 奖励污染 PPO 训练
+    if train_ppo and ppo_pending_assignments:
+        env_decision_time = np.array(env.UAV_state["8_decision_time"], dtype=np.float32).reshape(-1)
+        for _, record in ppo_pending_assignments.items():
+            completion_time_fallback = float(np.max(env_decision_time))
+            completion_time_fallback = max(completion_time_fallback, float(record["assign_time"]))
+            elapsed_time = max(1e-6, completion_time_fallback - float(record["assign_time"]))
+            settled_reward = -float(elapsed_time)
+            ppo.set_transition(record["buffer_idx"], reward=settled_reward, done=True)
+            ppo_episode_settled_rewards.append(settled_reward)
+        ppo_pending_assignments.clear()
 
     total_reward = sum(UAV_rewards)
     total_cost = sum(UAV_costs)
@@ -680,50 +769,62 @@ for episode in range(max_episodes):
     # 计算各 UAV 完成时间与 makespan（T_max = max_i T_i）
     uav_completion_times = [float(env.UAV_state["8_decision_time"][i, 0]) for i in range(num_UAVs)]
     T_max = max(uav_completion_times) if uav_completion_times else 0.0
-    T_min = min(uav_completion_times) if uav_completion_times else 0.0
 
     # PPO：按累计 timestep 的更新
     if train_ppo and len(ppo.buffer.rewards) > 0:
         # 记录当前 PPO buffer 的整体统计信息（跨 episode）
         ppo_rewards_arr = np.array(ppo.buffer.rewards, dtype=np.float32)
-        writer.add_scalar('ppo/buffer_mean_reward', float(ppo_rewards_arr.mean()), episode)
-        writer.add_scalar('ppo/buffer_total_reward', float(ppo_rewards_arr.sum()), episode)
-        writer.add_scalar('ppo/buffer_num_steps', int(ppo_rewards_arr.shape[0]), episode)
+        writer.add_scalar('ppo/buffer/reward_mean', float(ppo_rewards_arr.mean()), episode)
+        writer.add_scalar('ppo/buffer/reward_sum', float(ppo_rewards_arr.sum()), episode)
+        writer.add_scalar('ppo/buffer/sample_count', int(ppo_rewards_arr.shape[0]), episode)
 
         # 按累计 timestep 触发 PPO 参数更新，并记录更新诊断信息
-        if len(ppo.buffer.rewards) >= ppo_update_every_steps:
+        if warmup_remaining_ppo <= 0 and len(ppo.buffer.rewards) >= ppo_update_every_steps:
             update_info = ppo.update()
             if update_info is not None:
-                writer.add_scalar('ppo/update_actor_loss', update_info["actor_loss"], episode)
-                writer.add_scalar('ppo/update_critic_loss', update_info["critic_loss"], episode)
-                writer.add_scalar('ppo/update_approx_kl', update_info["approx_kl"], episode)
-                writer.add_scalar('ppo/update_clip_fraction', update_info["clip_fraction"], episode)
+                writer.add_scalar('ppo/update/actor_loss', update_info["actor_loss"], episode)
+                writer.add_scalar('ppo/update/critic_loss', update_info["critic_loss"], episode)
+                writer.add_scalar('ppo/update/approx_kl', update_info["approx_kl"], episode)
+                writer.add_scalar('ppo/update/clip_fraction', update_info["clip_fraction"], episode)
 
     if warmup_remaining > 0:
         warmup_remaining -= 1
+    if warmup_remaining_ppo > 0:
+        warmup_remaining_ppo -= 1
 
     # TensorBoard：简化且命名更清晰
-    writer.add_scalar('env/episode_total_reward', episode_reward, episode)
-    writer.add_scalar('env/episode_total_cost', episode_cost, episode)
-    writer.add_scalar('env/episode_T_max', T_max, episode)
-    writer.add_scalar('env/episode_steps', episode_steps, episode)
-    writer.add_scalar('buffer/replay_size', replay_buffer.size(), episode)
+    writer.add_scalar('metrics/episode_reward_total', episode_reward, episode)
+    writer.add_scalar('metrics/episode_cost_total', episode_cost, episode)
+    writer.add_scalar('metrics/episode_makespan', T_max, episode)
+    writer.add_scalar('metrics/episode_steps', episode_steps, episode)
+    writer.add_scalar('dynamic/episode_active', 1.0 if getattr(env, "dynamic_episode_active", False) else 0.0, episode)
+    writer.add_scalar('dynamic/new_remaining', float(getattr(env, "dynamic_new_remaining", 0)), episode)
+    writer.add_scalar('maddpg/buffer/replay_size', replay_buffer.size(), episode)
     if episode_critic_loss != 0.0:
         writer.add_scalar('maddpg/episode_critic_loss_sum', episode_critic_loss, episode)
         writer.add_scalar('maddpg/episode_actor_loss_sum', episode_actor_loss, episode)
     writer.add_scalar('training/phase_id', 0.0 if training_who == "ppo" else 1.0, episode)
     writer.add_scalar('training/num_alternations', num_alternations, episode)
+    writer.add_scalar('training/warmup_remaining_maddpg', float(warmup_remaining), episode)
+    writer.add_scalar('training/warmup_remaining_ppo', float(warmup_remaining_ppo), episode)
+    if ppo_episode_settled_rewards:
+        settled_arr = np.array(ppo_episode_settled_rewards, dtype=np.float32)
+        writer.add_scalar('ppo/settlement/reward_mean', float(settled_arr.mean()), episode)
+        writer.add_scalar('ppo/settlement/reward_sum', float(settled_arr.sum()), episode)
+        writer.add_scalar('ppo/settlement/count', int(settled_arr.shape[0]), episode)
+        writer.add_scalar('ppo/settlement/mean_completion_time', float(-settled_arr.mean()), episode)
     writer.flush()
 
     if episode % 10 == 0 or episode < 3:
         print(f"[Ep {episode}] training={training_who}, steps={episode_steps}, "
               f"reward={episode_reward:.2f}, cost={episode_cost:.4f}, "
-              f"T_max={T_max:.4f}, T_spread={T_max - T_min:.4f}, "
-              f"buffer={replay_buffer.size()}, alt={num_alternations}")
+              f"T_max={T_max:.4f}, "
+              f"buffer={replay_buffer.size()}, alt={num_alternations}, "
+              f"warmup_maddpg={warmup_remaining}, warmup_ppo={warmup_remaining_ppo}")
 
-    with open(log_file_path, 'a', encoding='utf-8') as f:
-        f.write(f"Episode {episode}: training={training_who}, reward={episode_reward:.4f}, "
-                f"cost={episode_cost:.4f}, T_max={T_max:.4f}, steps={episode_steps}\n")
+    with open(route_log_path, 'a', encoding='utf-8') as f:
+        f.write(f"Episode {episode}: phase={training_who}, reward={episode_reward:.4f}, "
+                f"cost={episode_cost:.4f}, makespan={T_max:.4f}, steps={episode_steps}\n")
         for i in range(num_UAVs):
             f.write(f"  UAV{i}: T={uav_completion_times[i]:.4f}, "
                     f"route={' -> '.join(map(str, UAV_routes[i]))}\n")
@@ -734,14 +835,21 @@ for episode in range(max_episodes):
             for rec in ppo_assign_records:
                 f.write(rec + "\n")
 
-    # 收敛检测（基于 CV）：PPO 阶段用 T_max（与其优化目标对齐），MADDPG 阶段用路由总成本
+    # 收敛检测（基于 CV）：
+    # PPO 阶段仅使用“已结算奖励”对应的平均完成时间；若本回合无结算样本则跳过该回合统计。
+    append_cost = True
     if training_who == "ppo":
-        _cost = float(T_max)
+        if ppo_episode_settled_rewards:
+            _cost = float(-np.mean(np.array(ppo_episode_settled_rewards, dtype=np.float32)))
+        else:
+            append_cost = False
+            print(f"[警告] Episode {episode}: PPO 回合无结算奖励，跳过收敛统计。")
     else:
         _cost = float(episode_cost)
-    recent_costs.append(_cost)
+    if append_cost:
+        recent_costs.append(_cost)
 
-    phase_ep_count = episode - phase_start_episode
+    phase_ep_count = episode - phase_start_episode + 1
     _sched_idx = min(num_alternations, len(_cv_schedule) - 1)
     conv_cv = _cv_schedule[_sched_idx]
     conv_window = _window_schedule[_sched_idx]
@@ -750,7 +858,8 @@ for episode in range(max_episodes):
         recent_costs.pop(0)
 
     converged = False
-    if phase_ep_count >= min_episodes_before_switch and len(recent_costs) >= conv_window:
+    required_phase_eps = min_ppo_episodes_before_switch if training_who == "ppo" else min_episodes_before_switch
+    if phase_ep_count >= required_phase_eps and len(recent_costs) >= conv_window:
         mean_c = np.mean(recent_costs)
         std_c = np.std(recent_costs)
         cv = std_c / (mean_c + 1e-8)
@@ -768,18 +877,24 @@ for episode in range(max_episodes):
             unfreeze_params(maddpg.actor, maddpg.critic)
             maddpg.actor_optimizer = optim.Adam(maddpg.actor.parameters(), lr=5e-5)
             maddpg.critic_optimizer = optim.Adam(maddpg.critic.parameters(), lr=5e-5)
+            # 切换阶段时清空 MADDPG replay buffer，避免跨阶段旧数据干扰
             replay_buffer = ReplayBuffer(capacity=20000)
-            warmup_remaining = warmup_episodes_after_switch
+            warmup_remaining = warmup_episodes_after_switch_maddpg
+            warmup_remaining_ppo = 0
             training_who = "maddpg"
-            print(f"[切换] 冻结 PPO，解冻 MADDPG 开始训练（预热 {warmup_episodes_after_switch} ep）")
+            print(f"[切换] 冻结 PPO，解冻 MADDPG 开始训练（预热 {warmup_episodes_after_switch_maddpg} ep）")
         else:
             freeze_params(maddpg.actor, maddpg.critic)
             unfreeze_params(ppo.actor, ppo.critic)
             ppo.optimizer_actor = optim.Adam(ppo.actor.parameters(), lr=5e-5)
             ppo.optimizer_critic = optim.Adam(ppo.critic.parameters(), lr=5e-5)
+            # 切换阶段时清空 MADDPG replay buffer，保证下一个 MADDPG 阶段从新数据起步
+            replay_buffer = ReplayBuffer(capacity=20000)
+            warmup_remaining_ppo = warmup_episodes_after_switch_ppo
+            warmup_remaining = 0
             training_who = "ppo"
             full_cycle_count += 1
-            print(f"[切换] 冻结 MADDPG，解冻 PPO 开始训练（周期 {full_cycle_count}/{max_full_cycles_per_seed}）")
+            print(f"[切换] 冻结 MADDPG，解冻 PPO 开始训练（周期 {full_cycle_count}/{max_full_cycles_per_seed}，PPO预热 {warmup_episodes_after_switch_ppo} ep）")
 
         num_alternations += 1
         recent_costs = []
@@ -798,7 +913,7 @@ train_end_time = time.time()
 total_train_seconds = train_end_time - train_start_time
 print(f"总训练时长: {total_train_seconds:.2f} 秒, 交替次数: {num_alternations}")
 
-with open(log_file_path, 'a', encoding='utf-8') as f:
+with open(route_log_path, 'a', encoding='utf-8') as f:
     f.write(f"\nTotal training time: {total_train_seconds:.2f} seconds\n")
     f.write(f"Total alternations: {num_alternations}\n")
 
@@ -817,9 +932,8 @@ torch.save({
 }, os.path.join(save_dir, 'ppo_maddpg_final.pt'))
 print(f"[保存] 最终模型已保存至: {os.path.join(save_dir, 'ppo_maddpg_final.pt')}")
 
-# 事件记录
-events_path = os.path.join(result_dir, 'events.txt')
-with open(events_path, 'w', encoding='utf-8') as f:
+# 事件记录（无人机损坏 + 动态新客户）
+with open(event_log_path, 'w', encoding='utf-8') as f:
     f.write("==== Broken events ====\n")
     f.write(f"Total broken events: {len(env.broken_events)}\n")
     for ev in env.broken_events:
@@ -830,4 +944,4 @@ with open(events_path, 'w', encoding='utf-8') as f:
         f.write(str(ev) + "\n")
 
 writer.close()
-print(f"训练完成。日志目录: {result_dir}")
+print(f"训练完成。日志文件: {route_log_path}, {ppo_assign_log_path}, {event_log_path}")
