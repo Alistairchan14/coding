@@ -8,12 +8,15 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 
 import json
+import csv
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import time
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 from torch.utils.tensorboard import SummaryWriter
 from torch.distributions import Categorical
 
@@ -22,9 +25,6 @@ import maddpg as maddpg_module
 from maddpg import ReplayBuffer, get_device
 
 env = Environment(num_UAVs=3, num_customers=10, quiet=True)
-# 动态客户参数可在此覆盖环境默认值（默认 prob=0.1, max_new=2）
-# env.config['dynamic_customer_prob'] = 0.05
-# env.config['dynamic_max_new_per_step'] = 1
 maddpg_module._default_env = env
 
 device = get_device()
@@ -424,6 +424,78 @@ def unfreeze_params(*models):
             p.requires_grad = True
 
 
+def plot_gmm_tsne_from_replay_buffer(replay_buffer_obj, output_dir, max_points=5000, random_state=42):
+    """
+    训练结束后：基于 MADDPG ReplayBuffer 中的场景向量做 t-SNE，并按 GMM component 着色。
+    输出图片到 result/gmm_tsne_by_component.png。
+    """
+    if replay_buffer_obj is None or replay_buffer_obj.size() <= 1:
+        print("[t-SNE] ReplayBuffer 样本不足，跳过绘图。")
+        return
+
+    # 强制刷新一次 GMM 标签，确保 component 分类对应当前 buffer 全量数据
+    try:
+        replay_buffer_obj._refit_gmm()
+    except Exception as exc:
+        print(f"[t-SNE] GMM 拟合失败，跳过绘图: {exc}")
+        return
+
+    n_samples = replay_buffer_obj.size()
+    scene_all = replay_buffer_obj._scene_np[:n_samples]
+    labels_all = replay_buffer_obj._cached_labels
+    if scene_all is None or labels_all is None or len(labels_all) != n_samples:
+        print("[t-SNE] 缺少有效场景向量或标签，跳过绘图。")
+        return
+
+    if n_samples > max_points:
+        rng = np.random.default_rng(random_state)
+        chosen_idx = rng.choice(n_samples, size=max_points, replace=False)
+        scene_vis = scene_all[chosen_idx]
+        labels_vis = labels_all[chosen_idx]
+    else:
+        scene_vis = scene_all
+        labels_vis = labels_all
+
+    if scene_vis.shape[0] <= 1:
+        print("[t-SNE] 可视化样本不足，跳过绘图。")
+        return
+
+    perplexity = min(30, max(5, scene_vis.shape[0] // 10))
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        init="pca",
+        learning_rate="auto",
+        random_state=random_state,
+    )
+    embedded = tsne.fit_transform(scene_vis.astype(np.float64))
+
+    plt.figure(figsize=(8, 6))
+    unique_components = sorted(np.unique(labels_vis).tolist())
+    cmap = plt.cm.get_cmap("tab10", max(1, len(unique_components)))
+    for plot_idx, comp_id in enumerate(unique_components):
+        comp_mask = (labels_vis == comp_id)
+        plt.scatter(
+            embedded[comp_mask, 0],
+            embedded[comp_mask, 1],
+            s=12,
+            alpha=0.75,
+            color=cmap(plot_idx),
+            label=f"component_{int(comp_id)}",
+        )
+    plt.title("ReplayBuffer t-SNE by GMM Component")
+    plt.xlabel("t-SNE dim 1")
+    plt.ylabel("t-SNE dim 2")
+    plt.legend(loc="best", fontsize=8)
+    plt.tight_layout()
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, "gmm_tsne_by_component.png")
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+    print(f"[t-SNE] 已保存: {out_path}")
+
+
 # ==========================
 # 初始化
 # ==========================
@@ -481,11 +553,14 @@ ppo_update_every_steps = 50
 warmup_episodes_after_switch_maddpg = 30  # 切到 MADDPG 后预热：只收集数据不更新
 warmup_episodes_after_switch_ppo = 20      # 切到 PPO 后预热：只收集数据不更新
 
-max_episodes = 10000
+max_episodes = 20000
 min_episodes_before_switch = 100
-min_ppo_episodes_before_switch = 1000
-_cv_schedule     = [0.20, 0.18, 0.15, 0.12, 0.10, 0.08]
-_window_schedule = [  30,   35,   40,   45,   50,   50]
+min_ppo_episodes_before_switch = 500
+# 渐进式收敛判定：前期宽松，后期严格
+_cv_schedule     = [0.26, 0.22, 0.18, 0.14, 0.11, 0.09]
+_window_schedule = [  20,   25,   32,   40,   50,   60]
+_min_eps_schedule_maddpg = [80, 90, 100, 120, 140, 160]
+_min_eps_schedule_ppo    = [600, 700, 800, 900, 1000, 1100]
 recent_costs = []
 phase_start_episode = 0
 num_alternations = 0
@@ -506,6 +581,13 @@ os.makedirs(result_dir, exist_ok=True)
 log_dir = result_dir
 writer = SummaryWriter(log_dir=log_dir)
 
+# 独立分析输出目录（避免图与分析数据混在 result 里）
+analysis_root_dir = os.path.join(base_dir, "analysis_outputs")
+analysis_fig_dir = os.path.join(analysis_root_dir, "figures")
+analysis_metrics_dir = os.path.join(analysis_root_dir, "metrics")
+os.makedirs(analysis_fig_dir, exist_ok=True)
+os.makedirs(analysis_metrics_dir, exist_ok=True)
+
 route_log_path = os.path.join(result_dir, "maddpg_routing_log.txt")
 seed_log_file_path = os.path.join(result_dir, "convergence_log.txt")
 ppo_assign_log_path = os.path.join(result_dir, "ppo_assignment_log.txt")
@@ -513,6 +595,18 @@ event_log_path = os.path.join(result_dir, "environment_event_log.txt")
 for p in [route_log_path, seed_log_file_path, ppo_assign_log_path, event_log_path]:
     if os.path.exists(p):
         open(p, 'w').close()
+
+# 统一收敛曲线 CSV（跨算法通用格式）
+run_id = time.strftime("%Y%m%d_%H%M%S")
+curve_csv_path = os.path.join(analysis_metrics_dir, "training_curve_records.csv")
+if not os.path.exists(curve_csv_path):
+    with open(curve_csv_path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            "algorithm", "run_id", "episode",
+            "phase", "reward", "cost", "makespan",
+            "convergence_cost", "cv_value", "cv_threshold",
+            "is_converged",
+        ])
 
 train_start_time = time.time()
 print(f"[训练] max_episodes={max_episodes}, MADDPG batch_size={maddpg.batch_size}, "
@@ -853,16 +947,29 @@ for episode in range(max_episodes):
     _sched_idx = min(num_alternations, len(_cv_schedule) - 1)
     conv_cv = _cv_schedule[_sched_idx]
     conv_window = _window_schedule[_sched_idx]
+    conv_min_eps_maddpg = _min_eps_schedule_maddpg[_sched_idx]
+    conv_min_eps_ppo = _min_eps_schedule_ppo[_sched_idx]
+
+    # 记录当前阶段实际采用的收敛阈值，便于在 TB 中追踪调度效果
+    writer.add_scalar('convergence/current_cv_threshold', float(conv_cv), episode)
+    writer.add_scalar('convergence/current_window', float(conv_window), episode)
+    writer.add_scalar('convergence/current_min_eps_maddpg', float(conv_min_eps_maddpg), episode)
+    writer.add_scalar('convergence/current_min_eps_ppo', float(conv_min_eps_ppo), episode)
 
     if len(recent_costs) > conv_window:
         recent_costs.pop(0)
 
     converged = False
-    required_phase_eps = min_ppo_episodes_before_switch if training_who == "ppo" else min_episodes_before_switch
+    current_cv_value = np.nan
+    convergence_cost_value = np.nan
+    required_phase_eps = conv_min_eps_ppo if training_who == "ppo" else conv_min_eps_maddpg
     if phase_ep_count >= required_phase_eps and len(recent_costs) >= conv_window:
         mean_c = np.mean(recent_costs)
         std_c = np.std(recent_costs)
         cv = std_c / (mean_c + 1e-8)
+        current_cv_value = float(cv)
+        convergence_cost_value = float(mean_c)
+        writer.add_scalar('convergence/current_cv_value', float(cv), episode)
         if cv <= conv_cv:
             converged = True
             print(f"[收敛] {training_who} 在 episode {episode} 收敛 "
@@ -903,6 +1010,22 @@ for episode in range(max_episodes):
 
         # 不再在两个阶段各收敛一次后自动更换客户点，始终在同一批客户点上训练
 
+    # 统一 CSV 曲线记录（用于跨算法批量画图）
+    with open(curve_csv_path, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            "PPO+MADDPG",
+            run_id,
+            int(episode),
+            training_who,
+            float(episode_reward),
+            float(episode_cost),
+            float(T_max),
+            "" if np.isnan(convergence_cost_value) else float(convergence_cost_value),
+            "" if np.isnan(current_cv_value) else float(current_cv_value),
+            float(conv_cv),
+            int(converged),
+        ])
+
     if (episode + 1) >= max_episodes:
         print(f"已达到最大训练轮数 {max_episodes}，结束训练。")
 
@@ -942,6 +1065,9 @@ with open(event_log_path, 'w', encoding='utf-8') as f:
     f.write(f"Total dynamic customer events: {len(env.dynamic_customer_events)}\n")
     for ev in env.dynamic_customer_events:
         f.write(str(ev) + "\n")
+
+# 用 MADDPG replay buffer 做 GMM component 着色的 t-SNE 可视化
+plot_gmm_tsne_from_replay_buffer(replay_buffer, analysis_fig_dir)
 
 writer.close()
 print(f"训练完成。日志文件: {route_log_path}, {ppo_assign_log_path}, {event_log_path}")

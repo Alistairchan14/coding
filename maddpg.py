@@ -317,12 +317,31 @@ class ReplayBuffer:
             comp_id = int(self._cached_labels[idx])
             if 0 <= comp_id < n_comp:
                 final_counts[comp_id] += 1
+        indices = torch.tensor(sampled_idx, dtype=torch.long)
+        reward_cpu = self._fields[7][indices].float()
+        reward_batch_np = reward_cpu.reshape(-1).cpu().numpy()
+        sampled_labels = self._cached_labels[np.asarray(sampled_idx, dtype=np.int64)]
+
+        per_component_reward = []
+        for h in range(n_comp):
+            comp_rewards = reward_batch_np[sampled_labels == h]
+            per_component_reward.append({
+                "component": int(h),
+                "count": int(comp_rewards.size),
+                "ratio": float(comp_rewards.size) / float(total_selected),
+                "rewards": comp_rewards.tolist(),
+                "reward_mean": float(comp_rewards.mean()) if comp_rewards.size > 0 else 0.0,
+                "reward_std": float(comp_rewards.std()) if comp_rewards.size > 0 else 0.0,
+            })
+
         self.last_sample_stats = {
             "n_components": int(n_comp),
             "batch_component_ratio": [float(c) / float(total_selected) for c in final_counts],
+            "sampled_rewards": reward_batch_np.tolist(),
+            "sampled_reward_mean": float(reward_batch_np.mean()) if reward_batch_np.size > 0 else 0.0,
+            "sampled_reward_std": float(reward_batch_np.std()) if reward_batch_np.size > 0 else 0.0,
+            "per_component_reward": per_component_reward,
         }
-
-        indices = torch.tensor(sampled_idx, dtype=torch.long)
 
         samp_number = self._fields[0][indices].long().to(device)
         x_tensor = self._fields[1][indices].float().to(device)
@@ -331,7 +350,7 @@ class ReplayBuffer:
         UAV_obs = self._fields[4][indices].float().to(device)
         maintenance_action = self._fields[5][indices].float().to(device)
         routing_action = self._fields[6][indices].long().to(device)
-        reward = self._fields[7][indices].float().to(device)
+        reward = reward_cpu.to(device)
         next_UAV_obs = self._fields[8][indices].float().to(device)
         done = self._fields[9][indices].float().to(device)
         selected_UAV = self._fields[10][indices].long().to(device)

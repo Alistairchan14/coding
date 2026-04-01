@@ -260,7 +260,7 @@ class Environment(gym.Env):
             'weibull_function': lambda size=None: weibull_min(config['weibull_shape'], config['weibull_scale'], size),
             # 动态客户到达：每个 episode 先判定是否启用，再在步骤中随机时刻出现
             'dynamic_episode_prob': 0.3,        # episode 级概率：该轮是否存在动态客户到达
-            'dynamic_customer_prob': 0.02,      # 单个候选槽在一步中产生新客户的概率
+            'dynamic_customer_prob': 0.005,     # 单个候选槽在一步中产生新客户的概率（原 0.02 下调到约 0.25）
             'dynamic_max_new_per_step': 1,      # 每步最多产生的新客户数
             'dynamic_max_new_per_episode': 3    # 每个 episode 动态新客户总上限（0 表示不限制）
         }
